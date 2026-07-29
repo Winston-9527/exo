@@ -11,7 +11,13 @@ from pydantic import ValidationError
 
 from exo.api.main import API
 from exo.api.types import VerifiableChatCompletionRequest
-from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.models import model_cards
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelId,
+    ModelTask,
+    SamplingDefaults,
+)
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import TextGeneration
 from exo.shared.types.common import NodeId
@@ -174,7 +180,9 @@ def test_verifiable_chat_rejects_wrong_placement_digest() -> None:
     assert "placement digest" in response.json()["error"]["message"]
 
 
-async def test_verifiable_chat_dispatches_only_encrypted_input() -> None:
+async def test_verifiable_chat_dispatches_only_encrypted_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A valid request becomes an instance-bound task without plaintext fields."""
     instance, ingress_node, _ = _pipeline_instance()
     api = object.__new__(API)
@@ -182,6 +190,19 @@ async def test_verifiable_chat_dispatches_only_encrypted_input() -> None:
     api.paused = False
     send_mock = AsyncMock()
     api._send = send_mock  # pyright: ignore[reportPrivateUsage]
+
+    cached_card = next(
+        iter(instance.shard_assignments.runner_to_shard.values())
+    ).model_card.model_copy(
+        update={
+            "sampling_defaults": SamplingDefaults(
+                repetition_penalty=1.1,
+                presence_penalty=0.2,
+                frequency_penalty=0.3,
+            )
+        }
+    )
+    monkeypatch.setitem(model_cards.card_cache.cc, cached_card.model_id, cached_card)
 
     payload = _encrypted_request()
     recipient = payload["recipient"]
@@ -200,6 +221,9 @@ async def test_verifiable_chat_dispatches_only_encrypted_input() -> None:
     assert command.instance_id == instance.instance_id
     assert command.task_params.input == []
     assert command.task_params.verifiable is not None
+    assert command.task_params.repetition_penalty is None
+    assert command.task_params.presence_penalty is None
+    assert command.task_params.frequency_penalty is None
     serialized = command.model_dump_json()
     assert "secret prompt" not in serialized
     assert request.encrypted_input.ciphertext in serialized

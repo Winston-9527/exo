@@ -1019,6 +1019,15 @@ class API:
             ),
         )
         task_params = task_params.with_card_sampling_defaults()
+        # History-dependent processors would see dummy prompt IDs downstream and
+        # could make ranks sample different tokens or terminate at different times.
+        task_params = task_params.model_copy(
+            update={
+                "repetition_penalty": None,
+                "presence_penalty": None,
+                "frequency_penalty": None,
+            }
+        )
         command = TextGeneration(
             task_params=task_params,
             instance_id=InstanceId(payload.instance_id),
