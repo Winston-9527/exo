@@ -119,6 +119,50 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
     return None
 
 
+def _select_text_generation_instance_id(
+    state: State, command: TextGeneration
+) -> InstanceId:
+    """Select a decode instance, preserving an explicit placement binding."""
+    if command.instance_id is not None:
+        instance = state.instances.get(command.instance_id)
+        if instance is None:
+            raise ValueError(f"No requested instance found: {command.instance_id}")
+        if instance.shard_assignments.model_id != command.task_params.model:
+            raise ValueError(
+                "Requested instance model does not match text-generation model"
+            )
+        return command.instance_id
+
+    # set-difference => prefill-only nodes
+    prefill_only: set[InstanceId] = set()
+    for link in state.instance_links.values():
+        prefill_only.update(link.prefill_instances)
+    for link in state.instance_links.values():
+        prefill_only.difference_update(link.decode_instances)
+
+    in_flight = {TaskStatus.Pending, TaskStatus.Running}
+    instance_task_counts: dict[InstanceId, int] = {}
+    for instance in state.instances.values():
+        if (
+            instance.shard_assignments.model_id == command.task_params.model
+            and instance.instance_id not in prefill_only
+        ):
+            instance_task_counts[instance.instance_id] = sum(
+                1
+                for task in state.tasks.values()
+                if task.instance_id == instance.instance_id
+                and task.task_status in in_flight
+            )
+
+    if not instance_task_counts:
+        raise ValueError(f"No instance found for model {command.task_params.model}")
+
+    return min(
+        instance_task_counts,
+        key=lambda instance_id: instance_task_counts[instance_id],
+    )
+
+
 class Master:
     def __init__(
         self,
@@ -181,51 +225,18 @@ class Master:
                         case TestCommand():
                             pass
                         case TextGeneration():
-                            # set-difference => prefill-only nodes
-                            prefill_only: set[InstanceId] = set()
-                            for link in self.state.instance_links.values():
-                                prefill_only.update(link.prefill_instances)
-                            for link in self.state.instance_links.values():
-                                prefill_only.difference_update(link.decode_instances)
-
-                            for instance in self.state.instances.values():
-                                # NON-prefill-only instances matching the model ID
-                                if (
-                                    instance.shard_assignments.model_id
-                                    == command.task_params.model
-                                    and instance.instance_id not in prefill_only
-                                ):
-                                    # count in-flight tasks of that instance
-                                    in_flight = {TaskStatus.Pending, TaskStatus.Running}
-                                    task_count = sum(
-                                        1
-                                        for task in self.state.tasks.values()
-                                        if task.instance_id == instance.instance_id
-                                        and task.task_status in in_flight
-                                    )
-                                    instance_task_counts[instance.instance_id] = (
-                                        task_count
-                                    )
-
-                            # there are no NON-prefill-only instances matching this model ID
-                            if not instance_task_counts:
-                                raise ValueError(
-                                    f"No instance found for model {command.task_params.model}"
-                                )
-
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
+                            decode_instance_id = _select_text_generation_instance_id(
+                                self.state, command
                             )
-
-                            decode_instance_id = available_instance_ids[0]
                             task_id = TaskId()
                             params = command.task_params.model_copy(
                                 update={
-                                    "prefill_endpoint": _prefill_endpoint_for(
-                                        self.state, decode_instance_id
+                                    "prefill_endpoint": (
+                                        None
+                                        if command.task_params.verifiable is not None
+                                        else _prefill_endpoint_for(
+                                            self.state, decode_instance_id
+                                        )
                                     ),
                                 }
                             )

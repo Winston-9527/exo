@@ -21,6 +21,7 @@ from exo.shared.types.profiling import (
     ThunderboltBridgeStatus,
 )
 from exo.shared.types.tasks import Task, TaskId
+from exo.shared.types.verifiable import VerifiableInputReceipt
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
 from exo.shared.types.worker.runners import RunnerId, RunnerStatus
@@ -67,6 +68,7 @@ class State(FrozenModel):
 
     instance_links: Mapping[InstanceLinkId, InstanceLink] = {}
     prefill_server_ports: Mapping[RunnerId, int] = {}
+    verifiable_receipts: Mapping[str, Sequence[VerifiableInputReceipt]] = {}
 
     # User-added model cards. Workers can reconcile their on-disk custom card cache
     custom_model_cards: Mapping[ModelId, ModelCard] = {}

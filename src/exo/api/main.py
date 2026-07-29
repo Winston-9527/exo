@@ -99,6 +99,7 @@ from exo.api.types import (
     TraceRankStats,
     TraceResponse,
     TraceStatsResponse,
+    VerifiableChatCompletionRequest,
     normalize_image_size,
 )
 from exo.api.types.claude_api import (
@@ -198,14 +199,21 @@ from exo.shared.types.text_generation import (
     Base64ImageHash,
     TextGenerationTaskParams,
 )
+from exo.shared.types.verifiable import (
+    VerifiableAuditResponse,
+    VerifiableProviderIdentity,
+    VerifiableTaskMetadata,
+)
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.banner import print_startup_banner
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.power_sampler import PowerSampler
 from exo.utils.task_group import TaskGroup
+from exo.verifiable.identity import local_delivery_identity
+from exo.verifiable.placement import placement_digest
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
@@ -361,6 +369,13 @@ class API:
         self.app.get("/models/search")(self.search_models)
         self.app.post("/v1/chat/completions", response_model=None)(
             self.chat_completions
+        )
+        self.app.post("/v1/verifiable/chat/completions", response_model=None)(
+            self.verifiable_chat_completions
+        )
+        self.app.get("/v1/verifiable/identity")(self.get_verifiable_identity)
+        self.app.get("/v1/verifiable/audit/{request_id}")(
+            self.get_verifiable_audit
         )
         self.app.post("/bench/chat/completions", response_model=None)(
             self.bench_chat_completions
@@ -946,6 +961,109 @@ class API:
                 ),
                 media_type="application/json",
             )
+
+    async def verifiable_chat_completions(
+        self, payload: VerifiableChatCompletionRequest
+    ) -> StreamingResponse:
+        """Accept an encrypted request only when its recipient is the first shard."""
+        instance = self.state.instances.get(InstanceId(payload.instance_id))
+        if instance is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND,
+                detail=f"Instance {payload.instance_id} was not found",
+            )
+
+        first_shard_nodes: list[NodeId] = []
+        for node_id, runner_id in instance.shard_assignments.node_to_runner.items():
+            shard = instance.shard_assignments.runner_to_shard[runner_id]
+            if not isinstance(shard, PipelineShardMetadata):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="Verifiable requests require a pure pipeline placement",
+                )
+            if shard.is_first_layer:
+                first_shard_nodes.append(node_id)
+
+        if len(first_shard_nodes) != 1:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Verifiable requests require exactly one first pipeline shard",
+            )
+
+        if payload.recipient.node_id != first_shard_nodes[0]:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Encrypted recipient is not the first pipeline shard",
+            )
+
+        if payload.placement_digest != placement_digest(instance):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Encrypted request placement digest does not match the instance",
+            )
+
+        task_params = TextGenerationTaskParams(
+            model=payload.model,
+            input=[],
+            max_output_tokens=payload.generation.max_output_tokens,
+            temperature=payload.generation.temperature,
+            seed=payload.generation.seed,
+            stream=payload.generation.stream,
+            use_prefix_cache=False,
+            verifiable=VerifiableTaskMetadata(
+                protocol_version=payload.protocol_version,
+                request_id=payload.request_id,
+                placement_digest=payload.placement_digest,
+                recipient=payload.recipient,
+                encrypted_input=payload.encrypted_input,
+            ),
+        )
+        task_params = task_params.with_card_sampling_defaults()
+        command = TextGeneration(
+            task_params=task_params,
+            instance_id=InstanceId(payload.instance_id),
+        )
+        await self._send(command)
+
+        if payload.generation.stream:
+            return StreamingResponse(
+                with_sse_keepalive(
+                    generate_chat_stream(
+                        command.command_id,
+                        self._token_chunk_stream(command.command_id),
+                    ),
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "close",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        return StreamingResponse(
+            collect_chat_response(
+                command.command_id,
+                self._token_chunk_stream(command.command_id),
+            ),
+            media_type="application/json",
+        )
+
+    def get_verifiable_identity(self) -> VerifiableProviderIdentity:
+        """Return this node's public delivery identity for requester encryption."""
+        return local_delivery_identity(self.node_id)
+
+    def get_verifiable_audit(self, request_id: str) -> VerifiableAuditResponse:
+        receipts = list(self.state.verifiable_receipts.get(request_id, ()))
+        if not receipts:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND,
+                detail=f"No verifiable audit receipts found for {request_id}",
+            )
+        return VerifiableAuditResponse(
+            request_id=request_id,
+            expected_ranks=receipts[0].world_size,
+            receipts=receipts,
+        )
 
     async def bench_chat_completions(
         self, payload: BenchChatCompletionRequest

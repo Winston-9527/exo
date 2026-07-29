@@ -31,6 +31,7 @@ from exo.shared.types.events import (
     TopologyEdgeDeleted,
     TracesCollected,
     TracesMerged,
+    VerifiableInputPrepared,
 )
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (
@@ -93,6 +94,8 @@ def event_apply(event: Event, state: State) -> State:
             return state
         case CustomModelCardAdded():
             return apply_custom_model_card_added(event, state)
+        case VerifiableInputPrepared():
+            return apply_verifiable_input_prepared(event, state)
         case CustomModelCardDeleted():
             return apply_custom_model_card_deleted(event, state)
         case InstanceCreated():
@@ -500,3 +503,21 @@ def apply_custom_model_card_deleted(
         if model_id != event.model_id
     }
     return state.model_copy(update={"custom_model_cards": new_cards})
+
+
+def apply_verifiable_input_prepared(
+    event: VerifiableInputPrepared, state: State
+) -> State:
+    receipt = event.receipt
+    existing = list(state.verifiable_receipts.get(receipt.request_id, ()))
+    by_rank = {item.device_rank: item for item in existing}
+    by_rank[receipt.device_rank] = receipt
+    updated = tuple(by_rank[rank] for rank in sorted(by_rank))
+    return state.model_copy(
+        update={
+            "verifiable_receipts": {
+                **state.verifiable_receipts,
+                receipt.request_id: updated,
+            }
+        }
+    )

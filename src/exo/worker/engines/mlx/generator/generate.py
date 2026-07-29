@@ -31,6 +31,7 @@ from exo.shared.types.text_generation import (
 from exo.shared.types.worker.runner_response import (
     GenerationResponse,
 )
+from exo.verifiable.runtime import private_prompt_token_plan
 from exo.worker.engines.mlx.auto_parallel import (
     PipelineFirstLayer,
     PipelineLastLayer,
@@ -540,6 +541,8 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
+    private_prompt_source_rank: int | None = None,
+    on_private_prompt_prepared: Callable[[int], None] | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -550,6 +553,32 @@ def mlx_generate(
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
     all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
+    if private_prompt_source_rank is not None:
+        rank = 0 if group is None else group.rank()
+        local_token_ids = (
+            cast(list[int], all_prompt_tokens.tolist())
+            if rank == private_prompt_source_rank
+            else []
+        )
+        if group is None:
+            gathered_lengths = [len(local_token_ids)]
+        else:
+            gathered_lengths = cast(
+                list[int],
+                mx.distributed.all_gather(
+                    mx.array([len(local_token_ids)]), group=group
+                ).tolist(),
+            )
+        all_prompt_tokens = mx.array(
+            private_prompt_token_plan(
+                local_token_ids=local_token_ids,
+                rank=rank,
+                source_rank=private_prompt_source_rank,
+                gathered_lengths=gathered_lengths,
+            )
+        )
+        if on_private_prompt_prepared is not None:
+            on_private_prompt_prepared(len(all_prompt_tokens))
     min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
 
     vision: VisionResult | None = None

@@ -9,6 +9,7 @@ from exo.shared.types.chunks import Chunk, InputImageChunk
 from exo.shared.types.common import CommandId, Id, ModelId, NodeId, SessionId, SystemId
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.tasks import Task, TaskId, TaskStatus
+from exo.shared.types.verifiable import VerifiableInputReceipt
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
 from exo.shared.types.worker.runners import RunnerId, RunnerStatus
@@ -146,6 +147,10 @@ class InstanceLinkDeleted(BaseEvent):
     link_id: InstanceLinkId
 
 
+class VerifiableInputPrepared(BaseEvent):
+    receipt: VerifiableInputReceipt
+
+
 Event = (
     TestEvent
     | TaskCreated
@@ -169,6 +174,7 @@ Event = (
     | CustomModelCardDeleted
     | InstanceLinkCreated
     | InstanceLinkDeleted
+    | VerifiableInputPrepared
 )
 
 
