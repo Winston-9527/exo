@@ -69,6 +69,7 @@ impl PyNetworkingHandle {
         namespace: &str,
         listen_port: u16,
         discovery_service_port: u16,
+        bootstrap_peers: Vec<String>,
     ) -> PyResult<PyNetworkingHandle> {
         // todo: zenoh self assigned peers
         if listen_port == 0 {
@@ -92,6 +93,7 @@ impl PyNetworkingHandle {
                 from_client,
                 listen_port,
                 discovery_service_port,
+                bootstrap_peers,
             ))
             .pyerr()?;
 

@@ -198,8 +198,14 @@ pub async fn create_swarm(
     from_client: mpsc::Receiver<ToSwarm>,
     listen_port: u16,
     discovery_service_port: u16,
+    bootstrap_peers: Vec<String>,
 ) -> Result<Swarm> {
-    let cfg = crate::cfg(identity, listen_port)?;
+    let bootstrap_endpoints = bootstrap_peers
+        .into_iter()
+        .map(|endpoint| endpoint.parse::<zenoh::config::EndPoint>())
+        .collect::<Result<Vec<_>>>()?;
+    let mut cfg = crate::cfg(identity, listen_port)?;
+    let _previous_endpoints = cfg.connect.endpoints.set(bootstrap_endpoints);
     let session = crate::open(cfg, namespace, listen_port, discovery_service_port).await?;
     Ok(Swarm {
         session,

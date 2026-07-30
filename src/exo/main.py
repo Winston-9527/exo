@@ -58,6 +58,7 @@ class Node:
             namespace=args.namespace,
             listen_port=args.zenoh_port,
             discovery_service_port=args.discovery_port,
+            bootstrap_peers=args.bootstrap_peers,
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -349,9 +350,6 @@ def main_inner(args: "Args"):
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
-    if args.bootstrap_peers:
-        raise ValueError("Bootstrap peers has been temporarily removed")
-
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
         logger.info("Continuous batching disabled (--no-batch)")
@@ -462,14 +460,21 @@ class Args(FrozenModel):
             if os.getenv("EXO_BOOTSTRAP_PEERS")
             else [],
             dest="bootstrap_peers",
-            help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
+            help=(
+                "Comma-separated Zenoh TCP endpoints to connect to on startup, for "
+                "example tcp/100.64.0.2:52414. Static connections bypass "
+                "namespace-based discovery filtering (env: EXO_BOOTSTRAP_PEERS)."
+            ),
         )
         parser.add_argument(
             "--namespace",
             type=str,
             default=__version__,
             dest="namespace",
-            help="Discovery namespace, nodes with different namespaces will not connect.",
+            help=(
+                "Multicast discovery namespace. Static connections do not enforce "
+                "namespace matching."
+            ),
         )
         parser.add_argument(
             "--zenoh-port",

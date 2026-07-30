@@ -1,4 +1,5 @@
 import os
+from collections.abc import Sequence
 from copy import copy
 from itertools import count
 from math import inf
@@ -104,10 +105,15 @@ class Router:
         namespace: str,
         listen_port: int,
         discovery_service_port: int,
+        bootstrap_peers: Sequence[str] = (),
     ) -> "Router":
         return cls(
             handle=NetworkingHandle.new(
-                identity, namespace, listen_port, discovery_service_port
+                identity,
+                namespace,
+                listen_port,
+                discovery_service_port,
+                list(bootstrap_peers),
             )
         )
 

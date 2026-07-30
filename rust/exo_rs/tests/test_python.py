@@ -4,16 +4,33 @@ import os
 import pytest
 from _pytest.capture import CaptureFixture
 from exo_rs import (
+    FromSwarm,
     NetworkingHandle,
     Pidfile,
-    FromSwarm,
 )
+
+
+def test_rejects_invalid_bootstrap_endpoint() -> None:
+    with pytest.raises(RuntimeError, match="not-a-zenoh-endpoint"):
+        NetworkingHandle.new(
+            "1",
+            "python-binding-test",
+            52414,
+            52413,
+            ["not-a-zenoh-endpoint"],
+        )
 
 
 @pytest.mark.asyncio
 async def test_sleep_on_multiple_items() -> None:
     print("PYTHON: starting handle")
-    h = NetworkingHandle.new(os.urandom(16).hex().lstrip("0"), 52414, 52413)
+    h = NetworkingHandle.new(
+        os.urandom(16).hex().lstrip("0"),
+        "python-binding-test",
+        52414,
+        52413,
+        [],
+    )
     print("PYTHON: handle started")
 
     rt = asyncio.create_task(_await_recv(h))
