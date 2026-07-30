@@ -62,6 +62,7 @@ from exo.worker.engines.mlx.generator.verifiable_sync import (
     canonical_rank_local_value,
     canonical_rank_slice,
     minimum_prefix_hit_length,
+    should_use_remote_prefill,
     synchronize_rank_preparation,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -671,9 +672,10 @@ def mlx_generate(
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
 
-    # Do not use the prefix cache if we are trying to do benchmarks.
+    # An explicit per-request bypass must apply to normal inference as well as
+    # benchmarks.  ``None`` preserves EXO's normal shared-cache behaviour.
     is_bench = task.bench
-    if is_bench and not task.use_prefix_cache:
+    if not task.allows_prefix_cache():
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
@@ -742,9 +744,11 @@ def mlx_generate(
         if vision is not None
         else contextlib.nullcontext()
     )
-    use_remote = (
-        len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
-        and task.prefill_endpoint is not None
+    use_remote = should_use_remote_prefill(
+        prefix_cache_enabled=task.allows_prefix_cache(),
+        prompt_token_count=len(prompt_tokens),
+        minimum_prompt_tokens=REMOTE_PREFILL_MIN_TOKENS,
+        prefill_endpoint=task.prefill_endpoint,
     )
     remote_prefilled = False
     prefill_tps = 0.0

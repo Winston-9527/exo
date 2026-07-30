@@ -75,6 +75,21 @@ def minimum_prefix_hit_length(
     return max(1000, system_prompt_token_count())
 
 
+def should_use_remote_prefill(
+    *,
+    prefix_cache_enabled: bool,
+    prompt_token_count: int,
+    minimum_prompt_tokens: int,
+    prefill_endpoint: str | None,
+) -> bool:
+    """Allow remote prefill only when its shared cache is allowed for the task."""
+    return (
+        prefix_cache_enabled
+        and prompt_token_count > minimum_prompt_tokens
+        and prefill_endpoint is not None
+    )
+
+
 def should_run_debug_prompt_check(*, is_verifiable: bool) -> bool:
     """Debug prompt hooks are unsafe when only one rank holds the plaintext."""
     return not is_verifiable

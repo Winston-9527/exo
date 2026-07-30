@@ -9,6 +9,7 @@ from exo.worker.engines.mlx.generator.verifiable_sync import (
     canonical_rank_slice,
     minimum_prefix_hit_length,
     should_run_debug_prompt_check,
+    should_use_remote_prefill,
     synchronize_rank_preparation,
 )
 
@@ -149,6 +150,40 @@ def test_prefix_cache_threshold_retains_existing_minimum() -> None:
             system_prompt_token_count=lambda: 10,
         )
         == 1000
+    )
+
+
+@pytest.mark.parametrize("prompt_token_count", [1001, 4096, 4608])
+def test_explicit_no_cache_blocks_remote_prefill(prompt_token_count: int) -> None:
+    assert (
+        should_use_remote_prefill(
+            prefix_cache_enabled=False,
+            prompt_token_count=prompt_token_count,
+            minimum_prompt_tokens=1000,
+            prefill_endpoint="prefill.test:1234",
+        )
+        is False
+    )
+
+
+def test_remote_prefill_retains_existing_enabled_policy() -> None:
+    assert (
+        should_use_remote_prefill(
+            prefix_cache_enabled=True,
+            prompt_token_count=1001,
+            minimum_prompt_tokens=1000,
+            prefill_endpoint="prefill.test:1234",
+        )
+        is True
+    )
+    assert (
+        should_use_remote_prefill(
+            prefix_cache_enabled=True,
+            prompt_token_count=1000,
+            minimum_prompt_tokens=1000,
+            prefill_endpoint="prefill.test:1234",
+        )
+        is False
     )
 
 

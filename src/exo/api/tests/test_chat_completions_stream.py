@@ -6,10 +6,12 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from exo.api.adapters.chat_completions import (
+    chat_request_to_text_generation,
     collect_chat_response,
     generate_chat_stream,
 )
 from exo.api.types import (
+    ChatCompletionRequest,
     CompletionTokensDetails,
     PromptTokensDetails,
     ToolCallItem,
@@ -25,6 +27,49 @@ from exo.shared.types.common import CommandId, ModelId
 
 _TEST_MODEL = ModelId("test-model")
 _NULLABLE_DELTA_FIELDS = {"content", "refusal"}
+
+
+async def test_chat_request_propagates_explicit_prefix_cache_bypass() -> None:
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": str(_TEST_MODEL),
+            "messages": [{"role": "user", "content": "cache-policy"}],
+            "use_prefix_cache": False,
+        }
+    )
+
+    params = await chat_request_to_text_generation(request)
+
+    assert params.use_prefix_cache is False
+
+
+async def test_chat_request_omission_preserves_normal_prefix_cache_policy() -> None:
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": str(_TEST_MODEL),
+            "messages": [{"role": "user", "content": "cache-policy"}],
+        }
+    )
+
+    params = await chat_request_to_text_generation(request)
+
+    assert params.use_prefix_cache is None
+    assert params.allows_prefix_cache() is True
+
+
+async def test_chat_request_propagates_explicit_prefix_cache_enable() -> None:
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": str(_TEST_MODEL),
+            "messages": [{"role": "user", "content": "cache-policy"}],
+            "use_prefix_cache": True,
+        }
+    )
+
+    params = await chat_request_to_text_generation(request)
+
+    assert params.use_prefix_cache is True
+    assert params.allows_prefix_cache() is True
 
 
 def _make_usage(prompt_tokens: int = 1, completion_tokens: int = 1) -> Usage:

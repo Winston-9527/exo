@@ -41,6 +41,9 @@ from exo.worker.engines.mlx.generator.generate import (
     prefill,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.generator.verifiable_sync import (
+    should_use_remote_prefill,
+)
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
     set_needs_topk,
     take_ready_topk,
@@ -161,9 +164,7 @@ class ExoBatchGenerator:
         is_exact_hit = False
         prompt_tokens = all_prompt_tokens
 
-        if self.kv_prefix_cache is not None and (
-            not is_bench or task_params.use_prefix_cache
-        ):
+        if self.kv_prefix_cache is not None and task_params.allows_prefix_cache():
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
                     self.model, all_prompt_tokens, media_regions=media_regions
@@ -203,9 +204,11 @@ class ExoBatchGenerator:
             else contextlib.nullcontext()
         )
         uncached_count = len(prompt_tokens)
-        use_remote = (
-            uncached_count > REMOTE_PREFILL_MIN_TOKENS
-            and task_params.prefill_endpoint is not None
+        use_remote = should_use_remote_prefill(
+            prefix_cache_enabled=task_params.allows_prefix_cache(),
+            prompt_token_count=uncached_count,
+            minimum_prompt_tokens=REMOTE_PREFILL_MIN_TOKENS,
+            prefill_endpoint=task_params.prefill_endpoint,
         )
 
         _prefill_tps: float = 0.0
@@ -264,7 +267,7 @@ class ExoBatchGenerator:
                 c.values = c._trim(trim_size, c.values)
                 c._idx = c.max_size
 
-        if not is_bench or task_params.use_prefix_cache:
+        if task_params.allows_prefix_cache():
             min_prefix_hit_length = max(
                 1000, system_prompt_token_count(task_params, self.tokenizer)
             )

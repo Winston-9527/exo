@@ -247,10 +247,13 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # EXO extension: omit to preserve normal caching, or set false to require
+    # a fresh prefill for this request.
+    use_prefix_cache: bool | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):
-    use_prefix_cache: bool = False
+    use_prefix_cache: bool | None = False
 
 
 class AddCustomModelParams(BaseModel):

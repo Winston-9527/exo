@@ -70,6 +70,7 @@ class GenerationEvidence(FrozenModel):
     command_id: str
     token_count: int = Field(ge=0)
     token_ids_sha256: str
+    cached_prompt_tokens: int = Field(ge=0)
     final_text: ContentFingerprint
 
 
@@ -86,6 +87,7 @@ class PlacementEvidence(FrozenModel):
     baseline_instance_id: InstanceId
     verifiable_instance_id: InstanceId
     same_instance: bool
+    remote_prefill_links_absent: bool
 
 
 class AuditEvidence(FrozenModel):
@@ -145,6 +147,12 @@ def _select_instance(state: State, config: QualityCheckConfig) -> Instance:
     if config.expected_instance is not None and instance != config.expected_instance:
         raise QualityCheckError("Live placement does not match the frozen instance")
     return instance
+
+
+def _require_no_remote_prefill_links(state: State) -> None:
+    """Keep formal baseline and verifiable runs off shared remote-prefill state."""
+    if state.instance_links:
+        raise QualityCheckError("Quality comparison requires no remote-prefill links")
 
 
 def _ingress_node(instance: Instance) -> NodeId:
@@ -305,6 +313,72 @@ def _token_ids_for_command(events: JsonValue, command_id: str) -> list[int]:
         raise QualityCheckError("Token output continued after its terminal chunk")
     _require_completed_task(events, command_id)
     return token_ids
+
+
+def _cached_prompt_tokens_for_command(events: JsonValue, command_id: str) -> int:
+    """Return cache reuse reported by the one unique terminal token event."""
+    if not isinstance(events, list):
+        raise QualityCheckError("EXO /events did not return a list")
+    cached_values: list[int] = []
+    seen_chunk_events: dict[str, str] = {}
+    for untyped_event in events:
+        if not isinstance(untyped_event, dict):
+            continue
+        event = untyped_event.get("ChunkGenerated")
+        if not isinstance(event, dict):
+            continue
+        if _field(event, "command_id", "commandId") != command_id:
+            continue
+        chunk_container = event.get("chunk")
+        if not isinstance(chunk_container, dict):
+            continue
+        chunk = chunk_container.get("TokenChunk")
+        if not isinstance(chunk, dict):
+            continue
+        canonical_event = json.dumps(
+            event,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        event_id = event.get("event_id")
+        event_identity = (
+            f"event-id:{event_id}" if isinstance(event_id, str) else canonical_event
+        )
+        previous_event = seen_chunk_events.get(event_identity)
+        if previous_event is not None:
+            if previous_event != canonical_event:
+                raise QualityCheckError(
+                    "A token event id was reused for a conflicting payload"
+                )
+            continue
+        seen_chunk_events[event_identity] = canonical_event
+        if _field(chunk, "finish_reason", "finishReason") is None:
+            continue
+        usage = chunk.get("usage")
+        if not isinstance(usage, dict):
+            raise QualityCheckError("Terminal TokenChunk is missing usage evidence")
+        details = _field(
+            usage,
+            "prompt_tokens_details",
+            "promptTokensDetails",
+        )
+        if not isinstance(details, dict):
+            raise QualityCheckError("Terminal usage is missing prompt token details")
+        cached_tokens = _field(details, "cached_tokens", "cachedTokens")
+        if (
+            not isinstance(cached_tokens, int)
+            or isinstance(cached_tokens, bool)
+            or cached_tokens < 0
+        ):
+            raise QualityCheckError("Terminal usage has invalid cached token evidence")
+        cached_values.append(cached_tokens)
+    if len(cached_values) != 1:
+        raise QualityCheckError(
+            "A completed request must have one terminal cache-usage record"
+        )
+    _require_completed_task(events, command_id)
+    return cached_values[0]
 
 
 def _task_ids_for_command(events: JsonValue, command_id: str) -> set[str]:
@@ -619,6 +693,7 @@ def _fetch_events(
         try:
             for command_id in command_ids:
                 _token_ids_for_command(events, command_id)
+                _cached_prompt_tokens_for_command(events, command_id)
                 _task_instance_for_command(events, command_id)
         except QualityCheckError as error:
             latest_error = error
@@ -650,6 +725,7 @@ def run_quality_check(
     state_response.raise_for_status()
     # State is strict; JSON-mode validation preserves its enum/datetime wire conversions.
     state = State.model_validate_json(state_response.content)
+    _require_no_remote_prefill_links(state)
     instance = _select_instance(state, config)
     ingress_node_id = _ingress_node(instance)
     expected_ranks = _pipeline_world_size(instance)
@@ -678,6 +754,7 @@ def run_quality_check(
                 "repetition_penalty": 1.0,
                 "presence_penalty": 0.0,
                 "frequency_penalty": 0.0,
+                "use_prefix_cache": False,
             },
         )
     )
@@ -714,6 +791,12 @@ def run_quality_check(
     )
     baseline_tokens = _token_ids_for_command(events, baseline_command_id)
     verifiable_tokens = _token_ids_for_command(events, verifiable_command_id)
+    baseline_cached_prompt_tokens = _cached_prompt_tokens_for_command(
+        events, baseline_command_id
+    )
+    verifiable_cached_prompt_tokens = _cached_prompt_tokens_for_command(
+        events, verifiable_command_id
+    )
     baseline_instance_id = _task_instance_for_command(events, baseline_command_id)
     verifiable_instance_id = _task_instance_for_command(events, verifiable_command_id)
     placement = PlacementEvidence(
@@ -723,6 +806,7 @@ def run_quality_check(
             baseline_instance_id == instance.instance_id
             and verifiable_instance_id == instance.instance_id
         ),
+        remote_prefill_links_absent=True,
     )
 
     first_mismatch = _first_mismatch(baseline_tokens, verifiable_tokens)
@@ -750,6 +834,7 @@ def run_quality_check(
     postflight_state_response = client.get("/state")
     postflight_state_response.raise_for_status()
     postflight_state = State.model_validate_json(postflight_state_response.content)
+    _require_no_remote_prefill_links(postflight_state)
     postflight_instance = _select_instance(postflight_state, config)
     if postflight_instance != instance:
         raise QualityCheckError(
@@ -760,18 +845,23 @@ def run_quality_check(
         command_id=baseline_command_id,
         token_count=len(baseline_tokens),
         token_ids_sha256=_token_ids_digest(baseline_tokens),
+        cached_prompt_tokens=baseline_cached_prompt_tokens,
         final_text=_content_fingerprint(baseline_text),
     )
     verifiable_evidence = GenerationEvidence(
         command_id=verifiable_command_id,
         token_count=len(verifiable_tokens),
         token_ids_sha256=_token_ids_digest(verifiable_tokens),
+        cached_prompt_tokens=verifiable_cached_prompt_tokens,
         final_text=_content_fingerprint(verifiable_text),
     )
     passed = (
         comparison.token_ids_exact
         and comparison.final_text_exact
+        and baseline_cached_prompt_tokens == 0
+        and verifiable_cached_prompt_tokens == 0
         and placement.same_instance
+        and placement.remote_prefill_links_absent
         and audit.complete
         and audit.bindings_valid
         and audit.ingress_only_private_access

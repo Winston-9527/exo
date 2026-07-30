@@ -77,6 +77,7 @@ FailureClass = Literal[
     "transport_timeout",
     "http_error",
     "protocol_decode",
+    "cache_contamination",
     "quality_mismatch",
     "audit_incomplete",
     "audit_binding_invalid",
@@ -1378,8 +1379,16 @@ def _execute_quality_cell(
         and raw_receipts.matches_aggregate
     ):
         return CellExecutionResult(status="pass", evidence=evidence)
-    if not report.comparison.token_ids_exact or not report.comparison.final_text_exact:
-        failure_class: FailureClass = "quality_mismatch"
+    failure_class: FailureClass
+    if (
+        report.baseline.cached_prompt_tokens != 0
+        or report.verifiable.cached_prompt_tokens != 0
+    ):
+        failure_class = "cache_contamination"
+    elif (
+        not report.comparison.token_ids_exact or not report.comparison.final_text_exact
+    ):
+        failure_class = "quality_mismatch"
     elif not report.audit.complete:
         failure_class = "audit_incomplete"
     else:

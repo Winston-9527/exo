@@ -344,6 +344,7 @@ class SequentialGenerator(Engine):
             kv_prefix_cache=(
                 None
                 if task.task_params.verifiable is not None
+                or not effective_task_params.allows_prefix_cache()
                 else self.kv_prefix_cache
             ),
             on_prefill_progress=on_prefill_progress,

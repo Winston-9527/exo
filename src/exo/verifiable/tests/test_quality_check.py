@@ -1,17 +1,20 @@
 """Requester-side deterministic quality comparison through public EXO APIs."""
 
 import hashlib
+import json
 from typing import cast
 
 import httpx
 import pytest
 from pydantic import JsonValue
 
+from exo.api.types import CompletionTokensDetails, PromptTokensDetails, Usage
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.chunks import TokenChunk
 from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.events import ChunkGenerated, TaskCreated, TaskStatusUpdated
+from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.memory import Memory
 from exo.shared.types.state import State
 from exo.shared.types.tasks import TaskId, TaskStatus
@@ -32,6 +35,7 @@ from exo.verifiable.quality_check import (
     QualityCheckConfig,
     QualityCheckError,
     _fetch_events,  # pyright: ignore[reportPrivateUsage]
+    _require_no_remote_prefill_links,  # pyright: ignore[reportPrivateUsage]
     _task_instance_for_command,  # pyright: ignore[reportPrivateUsage]
     _token_ids_for_command,  # pyright: ignore[reportPrivateUsage]
     run_quality_check,
@@ -39,6 +43,22 @@ from exo.verifiable.quality_check import (
 
 MODEL = ModelId("mlx-community/Qwen3-0.6B-8bit")
 PROMPT = "Keep this requester prompt out of the JSON quality report."
+
+
+def test_quality_check_rejects_linked_remote_prefill() -> None:
+    link_id = InstanceLinkId("quality-link")
+    state = State(
+        instance_links={
+            link_id: InstanceLink(
+                link_id=link_id,
+                prefill_instances=[InstanceId("prefill-instance")],
+                decode_instances=[InstanceId("decode-instance")],
+            )
+        }
+    )
+
+    with pytest.raises(QualityCheckError, match="remote-prefill links"):
+        _require_no_remote_prefill_links(state)
 
 
 def _instance() -> MlxRingInstance:
@@ -105,6 +125,8 @@ def _events(
     instance_id: InstanceId,
     *,
     baseline_instance_id: InstanceId | None = None,
+    baseline_cached_tokens: int = 0,
+    verifiable_cached_tokens: int = 0,
     complete: bool = True,
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
@@ -132,13 +154,30 @@ def _events(
         if complete:
             chunks.append(("answer", 202, True))
         for text, token_id, is_final in chunks:
+            cached_tokens = (
+                baseline_cached_tokens
+                if command_id == "baseline-command"
+                else verifiable_cached_tokens
+            )
             event = ChunkGenerated(
                 command_id=CommandId(command_id),
                 chunk=TokenChunk(
                     model=MODEL,
                     text=text,
                     token_id=token_id,
-                    usage=None,
+                    usage=(
+                        Usage(
+                            prompt_tokens=12,
+                            completion_tokens=2,
+                            total_tokens=14,
+                            prompt_tokens_details=PromptTokensDetails(
+                                cached_tokens=cached_tokens
+                            ),
+                            completion_tokens_details=CompletionTokensDetails(),
+                        )
+                        if is_final
+                        else None
+                    ),
                     finish_reason="stop" if is_final else None,
                 ),
             )
@@ -300,6 +339,7 @@ def test_task_instance_binding_deduplicates_only_consistent_event_copies() -> No
         "reporting_fingerprint",
         "reporting_key_id",
         "baseline_instance",
+        "baseline_cache_hit",
         "postflight_instance",
     ],
 )
@@ -352,6 +392,7 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
         if request.method == "POST" and request.url.path == "/v1/chat/completions":
             assert request.url.host == "control.test"
             assert PROMPT in request.content.decode()
+            assert json.loads(request.content)["use_prefix_cache"] is False
             return httpx.Response(200, json=_chat_response("baseline-command"))
         if (
             request.method == "POST"
@@ -378,6 +419,9 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
                         InstanceId("unexpected-baseline-instance")
                         if tampered_binding == "baseline_instance"
                         else None
+                    ),
+                    baseline_cached_tokens=(
+                        3 if tampered_binding == "baseline_cache_hit" else 0
                     ),
                 ),
             )
@@ -537,6 +581,11 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
     assert report.placement.verifiable_instance_id == instance.instance_id
     assert report.placement.standard_api_exact_instance_binding is False
     assert report.placement.unique_model_instance_required is True
+    assert report.placement.remote_prefill_links_absent is True
+    assert report.baseline.cached_prompt_tokens == (
+        3 if tampered_binding == "baseline_cache_hit" else 0
+    )
+    assert report.verifiable.cached_prompt_tokens == 0
     assert report.audit.execution_id == (
         CommandId("other-execution")
         if tampered_binding == "audit_execution_id"
@@ -544,7 +593,8 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
     )
     assert report.audit.complete is (tampered_binding != "duplicate_rank")
     assert report.audit.bindings_valid is (
-        tampered_binding is None or tampered_binding == "baseline_instance"
+        tampered_binding is None
+        or tampered_binding in {"baseline_instance", "baseline_cache_hit"}
     )
     assert report.audit.private_input_nodes == [NodeId("node-ingress")]
     assert PROMPT not in serialized

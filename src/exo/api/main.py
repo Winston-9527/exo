@@ -1146,7 +1146,7 @@ class API:
             update={
                 "stream": False,
                 "bench": True,
-                "use_prefix_cache": payload.use_prefix_cache,
+                "use_prefix_cache": payload.use_prefix_cache is True,
             }
         )
 

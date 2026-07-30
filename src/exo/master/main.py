@@ -72,6 +72,7 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
+from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import InstanceId
 from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
@@ -117,6 +118,17 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
                 continue
             return f"{ip}:{port}"
     return None
+
+
+def _prefill_endpoint_for_task(
+    state: State,
+    decode_instance_id: InstanceId,
+    task_params: TextGenerationTaskParams,
+) -> str | None:
+    """Resolve remote prefill only when this task permits shared cache reuse."""
+    if task_params.verifiable is not None or not task_params.allows_prefix_cache():
+        return None
+    return _prefill_endpoint_for(state, decode_instance_id)
 
 
 def _select_text_generation_instance_id(
@@ -231,12 +243,10 @@ class Master:
                             task_id = TaskId()
                             params = command.task_params.model_copy(
                                 update={
-                                    "prefill_endpoint": (
-                                        None
-                                        if command.task_params.verifiable is not None
-                                        else _prefill_endpoint_for(
-                                            self.state, decode_instance_id
-                                        )
+                                    "prefill_endpoint": _prefill_endpoint_for_task(
+                                        self.state,
+                                        decode_instance_id,
+                                        command.task_params,
                                     ),
                                 }
                             )
