@@ -1634,6 +1634,59 @@ def test_token_preflight_uses_bound_qwen_fallback_without_jinja(
     assert tokenizer_evidence.file_count == 1
 
 
+def test_token_preflight_extracts_input_ids_from_batch_encoding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_directory = tmp_path / "tokenizer"
+    tokenizer_directory.mkdir()
+    (tokenizer_directory / "tokenizer.json").write_text("{}", encoding="utf-8")
+    config = _config_with_prompts(
+        tmp_path, output_directory=tmp_path / "results"
+    ).model_copy(update={"tokenizer_directory": str(tokenizer_directory)})
+    loaded = load_prompt_set(config)
+
+    class FakeTokenizer:
+        def apply_chat_template(
+            self,
+            conversation: list[dict[str, str]],
+            *,
+            tokenize: bool,
+            add_generation_prompt: bool,
+        ) -> object:
+            assert tokenize is True
+            assert add_generation_prompt is True
+            plaintext = conversation[0]["content"]
+            prompt_class = cast(
+                PromptClass,
+                next(
+                    candidate for candidate in PROMPT_CLASSES if candidate in plaintext
+                ),
+            )
+            target = quality_matrix.PROMPT_TOKEN_TARGETS[prompt_class]
+            return {
+                "input_ids": list(range(target)),
+                "attention_mask": [1] * target,
+            }
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> object:
+            del text, add_special_tokens
+            raise AssertionError("fallback tokenizer must not be used")
+
+    def load_tokenizer(directory: Path) -> FakeTokenizer:
+        del directory
+        return FakeTokenizer()
+
+    monkeypatch.setattr(quality_matrix, "_load_chat_tokenizer", load_tokenizer)
+
+    validated, _ = quality_matrix.validate_prompt_token_counts(config, loaded)
+
+    assert {
+        prompt_class: prompt.evidence.actual_prompt_tokens
+        for prompt_class, prompt in validated.items()
+    } == quality_matrix.PROMPT_TOKEN_TARGETS
+
+
 @pytest.mark.parametrize(
     "prompt_class",
     ["ascii_short", "zh_unicode", "code_json"],

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -821,6 +821,9 @@ def _single_user_chat_token_ids(
         _validate_qwen_single_user_template(tokenizer_directory)
         rendered = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         untyped_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+    if isinstance(untyped_token_ids, Mapping):
+        encoded_mapping = cast(Mapping[object, object], untyped_token_ids)
+        untyped_token_ids = encoded_mapping.get("input_ids")
     if not isinstance(untyped_token_ids, list):
         raise ValueError("The tokenizer returned non-list chat token IDs")
     token_objects = cast(list[object], untyped_token_ids)
