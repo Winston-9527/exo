@@ -88,13 +88,19 @@ def test_requester_encrypts_private_payload_to_placement_ingress() -> None:
             ]
         ),
         generation=VerifiableGenerationParams(
-            max_output_tokens=16, temperature=0.0, seed=42
+            max_output_tokens=16,
+            temperature=0.0,
+            seed=42,
+            logprobs=True,
+            top_logprobs=5,
         ),
         request_id="request-client-test",
     )
 
     assert request.recipient.node_id == NodeId("node-ingress")
     assert request.instance_id == "instance-client-test"
+    assert request.generation.logprobs is True
+    assert request.generation.top_logprobs == 5
     assert "private client prompt" not in request.model_dump_json()
 
 

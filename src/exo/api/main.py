@@ -1029,6 +1029,8 @@ class API:
             temperature=payload.generation.temperature,
             seed=payload.generation.seed,
             stream=payload.generation.stream,
+            logprobs=payload.generation.logprobs,
+            top_logprobs=payload.generation.top_logprobs,
             use_prefix_cache=False,
             verifiable=VerifiableTaskMetadata(
                 protocol_version=payload.protocol_version,

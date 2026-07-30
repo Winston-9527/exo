@@ -55,6 +55,8 @@ class VerifiableGenerationParams(FrozenModel):
     temperature: float = Field(ge=0.0)
     seed: int
     stream: bool = False
+    logprobs: bool = False
+    top_logprobs: int | None = Field(default=None, gt=0)
 
 
 class VerifiableEncryptedInput(FrozenModel):

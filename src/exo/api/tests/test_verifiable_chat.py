@@ -50,6 +50,8 @@ def _encrypted_request() -> dict[str, object]:
             "temperature": 0.0,
             "seed": 42,
             "stream": False,
+            "logprobs": True,
+            "top_logprobs": 5,
         },
         "encrypted_input": {
             "scheme": "X25519-HKDF-SHA256-AES256GCM",
@@ -303,9 +305,21 @@ async def test_verifiable_chat_dispatches_only_encrypted_input(
     assert command.instance_id == instance.instance_id
     assert command.task_params.input == []
     assert command.task_params.verifiable is not None
+    assert command.task_params.logprobs is True
+    assert command.task_params.top_logprobs == 5
     assert command.task_params.repetition_penalty is None
     assert command.task_params.presence_penalty is None
     assert command.task_params.frequency_penalty is None
     serialized = command.model_dump_json()
     assert "secret prompt" not in serialized
     assert request.encrypted_input.ciphertext in serialized
+
+
+def test_verifiable_chat_rejects_nonpositive_top_logprobs() -> None:
+    payload = _encrypted_request()
+    generation = payload["generation"]
+    assert isinstance(generation, dict)
+    generation["top_logprobs"] = 0
+
+    with pytest.raises(ValidationError):
+        VerifiableChatCompletionRequest.model_validate(payload)
