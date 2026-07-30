@@ -259,7 +259,7 @@ def _token_ids_for_command(events: JsonValue, command_id: str) -> list[int]:
 def _task_instance_for_command(events: JsonValue, command_id: str) -> InstanceId:
     if not isinstance(events, list):
         raise QualityCheckError("EXO /events did not return a list")
-    matching_instances: list[InstanceId] = []
+    matching_instances: set[InstanceId] = set()
     for untyped_event in events:
         if not isinstance(untyped_event, dict):
             continue
@@ -276,12 +276,12 @@ def _task_instance_for_command(events: JsonValue, command_id: str) -> InstanceId
             continue
         instance_id = _field(task, "instance_id", "instanceId")
         if isinstance(instance_id, str):
-            matching_instances.append(InstanceId(instance_id))
+            matching_instances.add(InstanceId(instance_id))
     if len(matching_instances) != 1:
         raise QualityCheckError(
-            "A completed request must have exactly one TaskCreated instance binding"
+            "A completed request must have exactly one unique TaskCreated instance binding"
         )
-    return matching_instances[0]
+    return next(iter(matching_instances))
 
 
 def _token_ids_digest(token_ids: list[int]) -> str:
@@ -511,7 +511,10 @@ def run_quality_check(
 ) -> QualityCheckReport:
     """Compare standard and encrypted EXO requests using public API evidence."""
     _assert_request_id_fresh(client, config.request_id)
-    state = State.model_validate(_response_json(client.get("/state")))
+    state_response = client.get("/state")
+    state_response.raise_for_status()
+    # State is strict; JSON-mode validation preserves its enum/datetime wire conversions.
+    state = State.model_validate_json(state_response.content)
     instance = _select_instance(state, config)
     ingress_node_id = _ingress_node(instance)
     expected_ranks = _pipeline_world_size(instance)

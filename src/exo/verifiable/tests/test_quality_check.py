@@ -4,6 +4,7 @@ import hashlib
 
 import httpx
 import pytest
+from pydantic import JsonValue
 
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
@@ -29,6 +30,7 @@ from exo.verifiable.identity import DELIVERY_KEY_ID, provider_id_from_public_key
 from exo.verifiable.quality_check import (
     QualityCheckConfig,
     QualityCheckError,
+    _task_instance_for_command,  # pyright: ignore[reportPrivateUsage]
     run_quality_check,
 )
 
@@ -116,7 +118,10 @@ def _events(
                 task_params=TextGenerationTaskParams(model=MODEL, input=[]),
             ),
         )
-        events.append(created.model_dump(mode="json"))
+        # Distributed event forwarding can surface the same TaskCreated event
+        # through the master and both workers. Every copy must bind to the same
+        # instance, but duplicate copies are not ambiguous by themselves.
+        events.extend([created.model_dump(mode="json")] * 3)
         for text, token_id, is_final in (
             ("same ", 101, False),
             ("answer", 202, True),
@@ -133,6 +138,47 @@ def _events(
             )
             events.append(event.model_dump(mode="json"))
     return events
+
+
+def test_task_instance_binding_deduplicates_only_consistent_event_copies() -> None:
+    command_id = "replicated-command"
+    expected_instance = InstanceId("expected-instance")
+    replicated_event: JsonValue = {
+        "TaskCreated": {
+            "task": {
+                "TextGeneration": {
+                    "command_id": command_id,
+                    "instance_id": str(expected_instance),
+                }
+            }
+        }
+    }
+    replicated_events: JsonValue = [
+        replicated_event,
+        replicated_event,
+        replicated_event,
+    ]
+
+    assert (
+        _task_instance_for_command(replicated_events, command_id) == expected_instance
+    )
+
+    conflicting_event: JsonValue = {
+        "TaskCreated": {
+            "task": {
+                "TextGeneration": {
+                    "command_id": command_id,
+                    "instance_id": "conflicting-instance",
+                }
+            }
+        }
+    }
+    conflicting_events: JsonValue = [replicated_event, conflicting_event]
+    with pytest.raises(QualityCheckError, match="exactly one unique"):
+        _task_instance_for_command(
+            conflicting_events,
+            command_id,
+        )
 
 
 @pytest.mark.parametrize(
@@ -179,7 +225,13 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
     def handle(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/state":
             assert request.url.host == "control.test"
-            state = State(instances={instance.instance_id: instance})
+            state = State(
+                instances={instance.instance_id: instance},
+                node_backends={
+                    NodeId("node-ingress"): [Backend.MlxCuda],
+                    NodeId("node-downstream"): [Backend.MlxMetal],
+                },
+            )
             return httpx.Response(
                 200, json=state.model_dump(mode="json", by_alias=True)
             )
