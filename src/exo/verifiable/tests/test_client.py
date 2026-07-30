@@ -8,6 +8,7 @@ from exo.shared.types.text_generation import InputMessage, InputMessageContent
 from exo.shared.types.verifiable import (
     VerifiableGenerationParams,
     VerifiableProviderIdentity,
+    VerifiableRecipient,
 )
 from exo.shared.types.worker.instances import InstanceId, MlxRingInstance
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
@@ -18,6 +19,7 @@ from exo.verifiable.crypto import (
     generate_delivery_private_key,
 )
 from exo.verifiable.identity import DELIVERY_KEY_ID, provider_id_from_public_key
+from exo.verifiable.placement import placement_digest
 from exo.verifiable.private_types import VerifiablePrivateTaskPayload
 
 
@@ -94,3 +96,21 @@ def test_requester_encrypts_private_payload_to_placement_ingress() -> None:
     assert request.recipient.node_id == NodeId("node-ingress")
     assert request.instance_id == "instance-client-test"
     assert "private client prompt" not in request.model_dump_json()
+
+
+def test_placement_commitment_binds_recipient_provider_identity() -> None:
+    instance = _instance()
+    recipient = VerifiableRecipient(
+        node_id=NodeId("node-ingress"),
+        provider_id="sha256:" + "a" * 64,
+        key_id=DELIVERY_KEY_ID,
+    )
+    substituted_provider = recipient.model_copy(
+        update={"provider_id": "sha256:" + "b" * 64}
+    )
+    substituted_key = recipient.model_copy(update={"key_id": "delivery-key-v2"})
+
+    committed = placement_digest(instance, recipient)
+
+    assert committed != placement_digest(instance, substituted_provider)
+    assert committed != placement_digest(instance, substituted_key)

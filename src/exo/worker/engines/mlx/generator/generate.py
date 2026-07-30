@@ -57,6 +57,13 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.generator.verifiable_sync import (
+    call_nonfatal,
+    canonical_rank_local_value,
+    canonical_rank_slice,
+    minimum_prefix_hit_length,
+    synchronize_rank_preparation,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -530,6 +537,58 @@ def extract_top_logprobs(
     return selected_logprob, top_logprob_items
 
 
+def gather_distributed_integers(
+    local_value: int, group: mx.distributed.Group | None
+) -> list[int]:
+    """Gather one public integer from every rank in deterministic rank order."""
+    if group is None:
+        return [local_value]
+    return cast(
+        list[int],
+        mx.distributed.all_gather(
+            mx.array([local_value], dtype=mx.int32), group=group
+        ).tolist(),
+    )
+
+
+def make_canonical_rank_sampler(
+    sampler: Callable[[mx.array], mx.array],
+    group: mx.distributed.Group | None,
+    source_rank: int,
+) -> Callable[[mx.array], mx.array]:
+    """Sample on one rank and return its token identically on every rank."""
+    world_size = 1 if group is None else group.size()
+    _ = canonical_rank_slice(
+        source_rank=source_rank,
+        world_size=world_size,
+        values_per_rank=1,
+    )
+    if group is None:
+        return sampler
+
+    rank = group.rank()
+
+    def synchronized_sampler(logprobs: mx.array) -> mx.array:
+        local_token = canonical_rank_local_value(
+            rank=rank,
+            source_rank=source_rank,
+            sample=lambda: sampler(logprobs),
+            placeholder=lambda: mx.zeros_like(mx.argmax(logprobs, axis=-1)),
+        )
+        values_per_rank = int(local_token.size)
+        selected = canonical_rank_slice(
+            source_rank=source_rank,
+            world_size=world_size,
+            values_per_rank=values_per_rank,
+        )
+        gathered_tokens = mx.distributed.all_gather(local_token, group=group)
+        synchronized_token = gathered_tokens[selected]
+        mx.eval(synchronized_token)
+        return synchronized_token
+
+    return synchronized_sampler
+
+
 def mlx_generate(
     model: Model,
     tokenizer: TokenizerWrapper,
@@ -550,10 +609,17 @@ def mlx_generate(
     seed = task.seed or 42
     mx.random.seed(seed)
 
-    # Encode prompt once at the top and fix unmatched think tags
-    all_prompt_tokens = encode_prompt(tokenizer, prompt)
-    all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
+    # Encode prompt once at the top and fix unmatched think tags. For private
+    # prompts, all ranks join readiness even when local tokenization fails.
+    def encode_and_fix_prompt() -> mx.array:
+        encoded = encode_prompt(tokenizer, prompt)
+        return fix_unmatched_think_end_tokens(encoded, tokenizer)
+
     if private_prompt_source_rank is not None:
+        all_prompt_tokens = synchronize_rank_preparation(
+            encode_and_fix_prompt,
+            lambda ready: gather_distributed_integers(ready, group),
+        )
         rank = 0 if group is None else group.rank()
         local_token_ids = (
             cast(list[int], all_prompt_tokens.tolist())
@@ -563,12 +629,7 @@ def mlx_generate(
         if group is None:
             gathered_lengths = [len(local_token_ids)]
         else:
-            gathered_lengths = cast(
-                list[int],
-                mx.distributed.all_gather(
-                    mx.array([len(local_token_ids)]), group=group
-                ).tolist(),
-            )
+            gathered_lengths = gather_distributed_integers(len(local_token_ids), group)
         all_prompt_tokens = mx.array(
             private_prompt_token_plan(
                 local_token_ids=local_token_ids,
@@ -578,8 +639,17 @@ def mlx_generate(
             )
         )
         if on_private_prompt_prepared is not None:
-            on_private_prompt_prepared(len(all_prompt_tokens))
-    min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
+            receipt_sent = call_nonfatal(
+                on_private_prompt_prepared, len(all_prompt_tokens)
+            )
+            if not receipt_sent:
+                logger.warning("Verifiable input receipt could not be emitted")
+    else:
+        all_prompt_tokens = encode_and_fix_prompt()
+    min_prefix_hit_length = minimum_prefix_hit_length(
+        prefix_cache_enabled=kv_prefix_cache is not None,
+        system_prompt_token_count=lambda: system_prompt_token_count(task, tokenizer),
+    )
 
     vision: VisionResult | None = None
     if vision_processor is not None:
@@ -646,6 +716,12 @@ def mlx_generate(
         min_p=task.min_p if task.min_p is not None else 0.05,
         top_k=task.top_k if task.top_k is not None else 0,
     )
+    if private_prompt_source_rank is not None:
+        sampler = make_canonical_rank_sampler(
+            sampler,
+            group,
+            private_prompt_source_rank,
+        )
 
     # Normalize stop sequences to a list
     stop_sequences: list[str] = (

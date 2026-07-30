@@ -40,8 +40,13 @@ from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
+    gather_distributed_integers,
     mlx_generate,
     warmup_inference,
+)
+from exo.worker.engines.mlx.generator.verifiable_sync import (
+    should_run_debug_prompt_check,
+    synchronize_rank_preparation,
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
@@ -258,27 +263,30 @@ class SequentialGenerator(Engine):
 
     def _build_generator(
         self, task: TextGeneration
-    ) -> tuple[
-        Generator[GenerationResponse], str, TextGenerationTaskParams
-    ]:
+    ) -> tuple[Generator[GenerationResponse], str, TextGenerationTaskParams]:
         private_prompt_source_rank: int | None = None
         verifiable_input_source: VerifiableInputSource | None = None
         effective_task_params = task.task_params
-        if task.task_params.verifiable is None:
+        is_verifiable = task.task_params.verifiable is not None
+        if not is_verifiable:
             prompt = apply_chat_template(self.tokenizer, task.task_params)
         else:
-            prepared = prepare_rank_generation_input(
-                task.task_params,
-                self.bound_instance,
-                self.delivery_private_key_loader,
-                lambda params: apply_chat_template(self.tokenizer, params),
+            prepared = synchronize_rank_preparation(
+                lambda: prepare_rank_generation_input(
+                    task.task_params,
+                    self.bound_instance,
+                    self.delivery_private_key_loader,
+                    lambda params: apply_chat_template(self.tokenizer, params),
+                ),
+                lambda ready: gather_distributed_integers(ready, self.group),
             )
             effective_task_params = prepared.task_params
             prompt = prepared.prompt
             private_prompt_source_rank = prepared.private_prompt_source_rank
             verifiable_input_source = prepared.source
 
-        _check_for_debug_prompts(effective_task_params)
+        if should_run_debug_prompt_check(is_verifiable=is_verifiable):
+            _check_for_debug_prompts(effective_task_params)
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:
@@ -321,6 +329,8 @@ class SequentialGenerator(Engine):
                         task.task_params,
                         self.bound_instance,
                         verifiable_input_source,
+                        execution_id=task.command_id,
+                        delivery_private_key_loader=self.delivery_private_key_loader,
                         prompt_token_count=prompt_token_count,
                     )
                 )

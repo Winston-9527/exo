@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from exo.shared.types.common import CommandId
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.verifiable import (
     VerifiableEncryptionContext,
@@ -27,6 +28,7 @@ class VerifiableInputSource(str, Enum):
 class PreparedVerifiableRankInput:
     source: VerifiableInputSource
     private_task_params: TextGenerationTaskParams | None
+    private_prompt_source_rank: int
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,32 @@ class PreparedRankGenerationInput:
     task_params: TextGenerationTaskParams
     prompt: str
     private_prompt_source_rank: int
+
+
+def _private_prompt_source_rank(bound_instance: BoundInstance) -> int:
+    assignments = bound_instance.instance.shard_assignments
+    shards: list[PipelineShardMetadata] = []
+    for runner_id in assignments.node_to_runner.values():
+        shard = assignments.runner_to_shard[runner_id]
+        if not isinstance(shard, PipelineShardMetadata):
+            raise ValueError("Verifiable tasks require a pure pipeline placement")
+        shards.append(shard)
+
+    ranks = sorted(shard.device_rank for shard in shards)
+    if ranks != list(range(len(shards))):
+        raise ValueError("Verifiable pipeline requires contiguous device ranks")
+
+    world_sizes = {shard.world_size for shard in shards}
+    if len(world_sizes) != 1 or next(iter(world_sizes)) != len(shards):
+        raise ValueError("Verifiable pipeline ranks must share a common world size")
+
+    first_shards = [shard for shard in shards if shard.is_first_layer]
+    if len(first_shards) != 1:
+        raise ValueError("Verifiable pipeline requires exactly one first layer")
+    source_rank = first_shards[0].device_rank
+    if source_rank != 0:
+        raise ValueError("Verifiable pipeline first layer must use device rank zero")
+    return source_rank
 
 
 def private_prompt_token_plan(
@@ -69,6 +97,8 @@ def build_verifiable_input_receipt(
     bound_instance: BoundInstance,
     source: VerifiableInputSource,
     *,
+    execution_id: CommandId,
+    delivery_private_key_loader: Callable[[], str],
     prompt_token_count: int,
 ) -> VerifiableInputReceipt:
     metadata = public_task_params.verifiable
@@ -80,13 +110,18 @@ def build_verifiable_input_receipt(
     ciphertext_digest = hashlib.sha256(
         metadata.encrypted_input.ciphertext.encode("ascii")
     ).hexdigest()
+    reporting_public_key = delivery_public_key(delivery_private_key_loader())
+    reporting_provider_id = provider_id_from_public_key(reporting_public_key)
     return VerifiableInputReceipt(
         request_id=metadata.request_id,
+        execution_id=execution_id,
         instance_id=str(bound_instance.instance.instance_id),
         placement_digest=metadata.placement_digest,
         node_id=bound_instance.bound_node_id,
-        provider_id=metadata.recipient.provider_id,
-        key_id=metadata.recipient.key_id,
+        reporting_provider_id=reporting_provider_id,
+        reporting_key_id=DELIVERY_KEY_ID,
+        recipient_provider_id=metadata.recipient.provider_id,
+        recipient_key_id=metadata.recipient.key_id,
         device_rank=shard.device_rank,
         world_size=shard.world_size,
         start_layer=shard.start_layer,
@@ -107,18 +142,24 @@ def prepare_verifiable_rank_input(
     if public_task_params.verifiable is None:
         raise ValueError("Task is not a verifiable encrypted text-generation task")
 
+    private_prompt_source_rank = _private_prompt_source_rank(bound_instance)
     shard = bound_instance.bound_shard
     if not isinstance(shard, PipelineShardMetadata):
         raise ValueError("Verifiable tasks require a pure pipeline shard")
 
     metadata = public_task_params.verifiable
-    if metadata.placement_digest != placement_digest(bound_instance.instance):
-        raise ValueError("Verifiable task placement digest does not match local instance")
+    if metadata.placement_digest != placement_digest(
+        bound_instance.instance, metadata.recipient
+    ):
+        raise ValueError(
+            "Verifiable task placement digest does not match local instance"
+        )
 
     if not shard.is_first_layer:
         return PreparedVerifiableRankInput(
             source=VerifiableInputSource.ShapeOnlyDummy,
             private_task_params=None,
+            private_prompt_source_rank=private_prompt_source_rank,
         )
 
     if metadata.recipient.node_id != bound_instance.bound_node_id:
@@ -155,6 +196,7 @@ def prepare_verifiable_rank_input(
     return PreparedVerifiableRankInput(
         source=VerifiableInputSource.DecryptedEnvelope,
         private_task_params=private_task_params,
+        private_prompt_source_rank=private_prompt_source_rank,
     )
 
 
@@ -175,7 +217,7 @@ def prepare_rank_generation_input(
             source=prepared.source,
             task_params=public_task_params,
             prompt="",
-            private_prompt_source_rank=0,
+            private_prompt_source_rank=prepared.private_prompt_source_rank,
         )
 
     private_task_params = prepared.private_task_params
@@ -184,5 +226,5 @@ def prepare_rank_generation_input(
         source=prepared.source,
         task_params=private_task_params,
         prompt=prompt_renderer(private_task_params),
-        private_prompt_source_rank=0,
+        private_prompt_source_rank=prepared.private_prompt_source_rank,
     )

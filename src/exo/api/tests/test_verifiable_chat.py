@@ -5,12 +5,12 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from exo.api.main import API
-from exo.api.types import VerifiableChatCompletionRequest
+from exo.api.types import VerifiableChatCompletionRequest, VerifiableRecipient
 from exo.shared.models import model_cards
 from exo.shared.models.model_cards import (
     ModelCard,
@@ -26,7 +26,10 @@ from exo.shared.types.state import State
 from exo.shared.types.worker.instances import InstanceId, MlxRingInstance
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import PipelineShardMetadata
-from exo.verifiable.identity import EXO_VERIFIABLE_KEY_PATH
+from exo.verifiable.identity import (
+    EXO_VERIFIABLE_KEY_PATH,
+    local_delivery_identity,
+)
 from exo.verifiable.placement import placement_digest
 
 
@@ -99,9 +102,7 @@ def _pipeline_instance() -> tuple[MlxRingInstance, NodeId, NodeId]:
     downstream_runner = RunnerId("runner-downstream")
     return (
         MlxRingInstance(
-            instance_id=InstanceId(
-                "instance-00000000-0000-4000-8000-000000000001"
-            ),
+            instance_id=InstanceId("instance-00000000-0000-4000-8000-000000000001"),
             shard_assignments=ShardAssignments(
                 model_id=model.model_id,
                 runner_to_shard={
@@ -137,9 +138,10 @@ def _pipeline_instance() -> tuple[MlxRingInstance, NodeId, NodeId]:
 
 def test_verifiable_chat_rejects_non_ingress_recipient() -> None:
     """The encrypted recipient must be the node assigned the first layer."""
-    instance, _, downstream_node = _pipeline_instance()
+    instance, ingress_node, downstream_node = _pipeline_instance()
     api = object.__new__(API)
     api.app = FastAPI()
+    api.node_id = ingress_node
     api.state = State(instances={instance.instance_id: instance})
     api._setup_exception_handlers()  # pyright: ignore[reportPrivateUsage]
     api.app.post("/v1/verifiable/chat/completions")(api.verifiable_chat_completions)
@@ -149,43 +151,120 @@ def test_verifiable_chat_rejects_non_ingress_recipient() -> None:
     assert isinstance(recipient, dict)
     recipient["node_id"] = str(downstream_node)
 
-    response = TestClient(api.app).post(
-        "/v1/verifiable/chat/completions", json=payload
-    )
+    response = TestClient(api.app).post("/v1/verifiable/chat/completions", json=payload)
 
     assert response.status_code == 400
     assert "first pipeline shard" in response.json()["error"]["message"]
 
 
-def test_verifiable_chat_rejects_wrong_placement_digest() -> None:
+def test_verifiable_chat_rejects_wrong_placement_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The API must recompute placement binding instead of trusting the requester."""
     instance, ingress_node, _ = _pipeline_instance()
+    monkeypatch.setenv(EXO_VERIFIABLE_KEY_PATH, str(tmp_path / "delivery.key"))
+    identity = local_delivery_identity(ingress_node)
     api = object.__new__(API)
     api.app = FastAPI()
+    api.node_id = ingress_node
     api.state = State(instances={instance.instance_id: instance})
     api._setup_exception_handlers()  # pyright: ignore[reportPrivateUsage]
     api.app.post("/v1/verifiable/chat/completions")(api.verifiable_chat_completions)
 
     payload = _encrypted_request()
-    recipient = payload["recipient"]
-    assert isinstance(recipient, dict)
-    recipient["node_id"] = str(ingress_node)
+    payload["recipient"] = {
+        "node_id": str(ingress_node),
+        "provider_id": identity.provider_id,
+        "key_id": identity.key_id,
+    }
     payload["placement_digest"] = "sha256:" + "0" * 64
 
-    response = TestClient(api.app).post(
-        "/v1/verifiable/chat/completions", json=payload
-    )
+    response = TestClient(api.app).post("/v1/verifiable/chat/completions", json=payload)
 
     assert response.status_code == 400
     assert "placement digest" in response.json()["error"]["message"]
 
 
+async def test_verifiable_chat_must_be_submitted_to_ingress_node_api() -> None:
+    instance, ingress_node, downstream_node = _pipeline_instance()
+    api = object.__new__(API)
+    api.node_id = downstream_node
+    api.state = State(instances={instance.instance_id: instance})
+    api.paused = False
+    send_mock = AsyncMock()
+    api._send = send_mock  # pyright: ignore[reportPrivateUsage]
+
+    payload = _encrypted_request()
+    recipient_payload = payload["recipient"]
+    assert isinstance(recipient_payload, dict)
+    recipient_payload["node_id"] = str(ingress_node)
+    recipient = VerifiableRecipient.model_validate(recipient_payload)
+    payload["placement_digest"] = placement_digest(instance, recipient)
+    request = VerifiableChatCompletionRequest.model_validate(payload)
+
+    with pytest.raises(HTTPException) as raised:
+        await api.verifiable_chat_completions(request)
+
+    assert raised.value.status_code == 400
+    assert "ingress node API" in str(raised.value.detail)
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("recipient_field", "substituted_value"),
+    [
+        ("provider_id", "sha256:" + "0" * 64),
+        ("key_id", "delivery-key-v2"),
+    ],
+)
+async def test_verifiable_chat_rejects_substituted_provider_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recipient_field: str,
+    substituted_value: str,
+) -> None:
+    instance, ingress_node, _ = _pipeline_instance()
+    monkeypatch.setenv(EXO_VERIFIABLE_KEY_PATH, str(tmp_path / "delivery.key"))
+    identity = local_delivery_identity(ingress_node)
+    local_recipient = VerifiableRecipient(
+        node_id=identity.node_id,
+        provider_id=identity.provider_id,
+        key_id=identity.key_id,
+    )
+    substituted_recipient = local_recipient.model_copy(
+        update={recipient_field: substituted_value}
+    )
+
+    api = object.__new__(API)
+    api.node_id = ingress_node
+    api.state = State(instances={instance.instance_id: instance})
+    api.paused = False
+    send_mock = AsyncMock()
+    api._send = send_mock  # pyright: ignore[reportPrivateUsage]
+
+    payload = _encrypted_request()
+    payload["recipient"] = substituted_recipient.model_dump(mode="json")
+    payload["placement_digest"] = placement_digest(instance, substituted_recipient)
+    request = VerifiableChatCompletionRequest.model_validate(payload)
+
+    with pytest.raises(HTTPException) as raised:
+        await api.verifiable_chat_completions(request)
+
+    assert raised.value.status_code == 400
+    assert "local delivery identity" in str(raised.value.detail)
+    send_mock.assert_not_awaited()
+
+
 async def test_verifiable_chat_dispatches_only_encrypted_input(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A valid request becomes an instance-bound task without plaintext fields."""
     instance, ingress_node, _ = _pipeline_instance()
+    monkeypatch.setenv(EXO_VERIFIABLE_KEY_PATH, str(tmp_path / "delivery.key"))
+    identity = local_delivery_identity(ingress_node)
     api = object.__new__(API)
+    api.node_id = ingress_node
     api.state = State(instances={instance.instance_id: instance})
     api.paused = False
     send_mock = AsyncMock()
@@ -205,10 +284,13 @@ async def test_verifiable_chat_dispatches_only_encrypted_input(
     monkeypatch.setitem(model_cards.card_cache.cc, cached_card.model_id, cached_card)
 
     payload = _encrypted_request()
-    recipient = payload["recipient"]
-    assert isinstance(recipient, dict)
-    recipient["node_id"] = str(ingress_node)
-    payload["placement_digest"] = placement_digest(instance)
+    request_recipient = VerifiableRecipient(
+        node_id=identity.node_id,
+        provider_id=identity.provider_id,
+        key_id=identity.key_id,
+    )
+    payload["recipient"] = request_recipient.model_dump(mode="json")
+    payload["placement_digest"] = placement_digest(instance, request_recipient)
     request = VerifiableChatCompletionRequest.model_validate(payload)
 
     await api.verifiable_chat_completions(request)

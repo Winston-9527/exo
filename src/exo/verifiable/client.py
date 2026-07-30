@@ -44,7 +44,7 @@ def build_verifiable_chat_request(
         provider_id=identity.provider_id,
         key_id=identity.key_id,
     )
-    digest = placement_digest(instance)
+    digest = placement_digest(instance, recipient)
     context = VerifiableEncryptionContext(
         protocol_version="verifiable-exo-v1",
         request_id=request_id,

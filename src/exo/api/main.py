@@ -374,9 +374,7 @@ class API:
             self.verifiable_chat_completions
         )
         self.app.get("/v1/verifiable/identity")(self.get_verifiable_identity)
-        self.app.get("/v1/verifiable/audit/{request_id}")(
-            self.get_verifiable_audit
-        )
+        self.app.get("/v1/verifiable/audit/{request_id}")(self.get_verifiable_audit)
         self.app.post("/bench/chat/completions", response_model=None)(
             self.bench_chat_completions
         )
@@ -990,13 +988,35 @@ class API:
                 detail="Verifiable requests require exactly one first pipeline shard",
             )
 
+        if self.node_id != first_shard_nodes[0]:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "Verifiable requests must be submitted to the placement "
+                    "ingress node API"
+                ),
+            )
+
         if payload.recipient.node_id != first_shard_nodes[0]:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST,
                 detail="Encrypted recipient is not the first pipeline shard",
             )
 
-        if payload.placement_digest != placement_digest(instance):
+        local_identity = local_delivery_identity(self.node_id)
+        if (
+            payload.recipient.provider_id != local_identity.provider_id
+            or payload.recipient.key_id != local_identity.key_id
+        ):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "Encrypted recipient does not match the ingress node's "
+                    "local delivery identity"
+                ),
+            )
+
+        if payload.placement_digest != placement_digest(instance, payload.recipient):
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST,
                 detail="Encrypted request placement digest does not match the instance",
@@ -1068,8 +1088,47 @@ class API:
                 status_code=HTTPStatus.NOT_FOUND,
                 detail=f"No verifiable audit receipts found for {request_id}",
             )
+        execution_ids = {receipt.execution_id for receipt in receipts}
+        if len(execution_ids) != 1:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=(
+                    f"Audit request {request_id} contains receipts from "
+                    "multiple executions"
+                ),
+            )
+        execution_id = next(iter(execution_ids))
+        common_fields = (
+            "request_id",
+            "instance_id",
+            "placement_digest",
+            "ciphertext_digest",
+            "world_size",
+            "recipient_provider_id",
+            "recipient_key_id",
+            "prompt_token_count",
+        )
+        for field in common_fields:
+            values = {getattr(receipt, field) for receipt in receipts}
+            if len(values) != 1:
+                raise HTTPException(
+                    status_code=HTTPStatus.CONFLICT,
+                    detail=(
+                        f"Audit request {request_id} contains conflicting "
+                        f"{field} values for execution {execution_id}"
+                    ),
+                )
+        if receipts[0].request_id != request_id:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=(
+                    f"Audit request {request_id} does not match receipt request_id "
+                    f"for execution {execution_id}"
+                ),
+            )
         return VerifiableAuditResponse(
             request_id=request_id,
+            execution_id=execution_id,
             expected_ranks=receipts[0].world_size,
             receipts=receipts,
         )

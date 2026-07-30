@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from exo.shared.types.common import ModelId, NodeId
+from exo.shared.types.common import CommandId, ModelId, NodeId
 from exo.utils.pydantic_ext import FrozenModel
 
 VerifiableEncryptionScheme = Literal["X25519-HKDF-SHA256-AES256GCM"]
@@ -25,11 +25,14 @@ class VerifiableProviderIdentity(FrozenModel):
 
 class VerifiableInputReceipt(FrozenModel):
     request_id: str
+    execution_id: CommandId
     instance_id: str
     placement_digest: str
     node_id: NodeId
-    provider_id: str
-    key_id: str
+    reporting_provider_id: str
+    reporting_key_id: str
+    recipient_provider_id: str
+    recipient_key_id: str
     device_rank: int = Field(ge=0)
     world_size: int = Field(gt=0)
     start_layer: int = Field(ge=0)
@@ -42,6 +45,7 @@ class VerifiableInputReceipt(FrozenModel):
 
 class VerifiableAuditResponse(FrozenModel):
     request_id: str
+    execution_id: CommandId
     expected_ranks: int = Field(gt=0)
     receipts: list[VerifiableInputReceipt]
 

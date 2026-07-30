@@ -3,11 +3,12 @@
 import hashlib
 import json
 
+from exo.shared.types.verifiable import VerifiableRecipient
 from exo.shared.types.worker.instances import Instance
 
 
-def placement_digest(instance: Instance) -> str:
-    """Return a stable digest over the model and every assigned shard role."""
+def placement_digest(instance: Instance, recipient: VerifiableRecipient) -> str:
+    """Commit to the model placement and its authorized ingress identity."""
     assignments = instance.shard_assignments
     shards: list[dict[str, int | str]] = []
     for node_id, runner_id in assignments.node_to_runner.items():
@@ -29,6 +30,11 @@ def placement_digest(instance: Instance) -> str:
             "protocol_version": "verifiable-exo-v1",
             "instance_id": str(instance.instance_id),
             "model_id": str(assignments.model_id),
+            "recipient": {
+                "node_id": str(recipient.node_id),
+                "provider_id": recipient.provider_id,
+                "key_id": recipient.key_id,
+            },
             "shards": shards,
         },
         sort_keys=True,

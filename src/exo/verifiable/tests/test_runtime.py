@@ -1,8 +1,12 @@
 """Rank-role tests for selective disclosure during task preparation."""
 
+from typing import Literal
+
+import pytest
+
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
-from exo.shared.types.common import NodeId
+from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import (
     InputMessage,
@@ -17,7 +21,7 @@ from exo.shared.types.verifiable import (
 )
 from exo.shared.types.worker.instances import BoundInstance, InstanceId, MlxRingInstance
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
-from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.shared.types.worker.shards import PipelineShardMetadata, TensorShardMetadata
 from exo.verifiable.crypto import (
     delivery_public_key,
     encrypt_private_payload,
@@ -97,8 +101,87 @@ def _ingress_bound_instance() -> BoundInstance:
     )
 
 
+def _invalid_placement(
+    case: Literal[
+        "non_pipeline",
+        "non_contiguous_rank",
+        "inconsistent_world_size",
+        "first_layer_not_rank_zero",
+        "multiple_first_layers",
+    ],
+) -> BoundInstance:
+    bound_instance = _downstream_bound_instance()
+    assignments = bound_instance.instance.shard_assignments
+    ingress_runner = assignments.node_to_runner[NodeId("node-ingress")]
+    downstream_runner = assignments.node_to_runner[NodeId("node-downstream")]
+    ingress = assignments.runner_to_shard[ingress_runner]
+    downstream = assignments.runner_to_shard[downstream_runner]
+    assert isinstance(ingress, PipelineShardMetadata)
+    assert isinstance(downstream, PipelineShardMetadata)
+
+    if case == "non_pipeline":
+        invalid_ingress = TensorShardMetadata(
+            model_card=ingress.model_card,
+            device_rank=ingress.device_rank,
+            world_size=ingress.world_size,
+            start_layer=ingress.start_layer,
+            end_layer=ingress.end_layer,
+            n_layers=ingress.n_layers,
+        )
+        invalid_downstream = downstream
+    elif case == "non_contiguous_rank":
+        invalid_ingress = ingress
+        invalid_downstream = downstream.model_copy(update={"device_rank": 2})
+    elif case == "inconsistent_world_size":
+        invalid_ingress = ingress
+        invalid_downstream = downstream.model_copy(update={"world_size": 3})
+    elif case == "first_layer_not_rank_zero":
+        invalid_ingress = ingress.model_copy(update={"device_rank": 1})
+        invalid_downstream = downstream.model_copy(update={"device_rank": 0})
+    else:
+        invalid_ingress = ingress
+        invalid_downstream = downstream.model_copy(update={"start_layer": 0})
+
+    invalid_assignments = assignments.model_copy(
+        update={
+            "runner_to_shard": {
+                ingress_runner: invalid_ingress,
+                downstream_runner: invalid_downstream,
+            }
+        }
+    )
+    invalid_instance = bound_instance.instance.model_copy(
+        update={"shard_assignments": invalid_assignments}
+    )
+    return bound_instance.model_copy(update={"instance": invalid_instance})
+
+
+def _task_for_bound_instance(
+    bound_instance: BoundInstance,
+) -> TextGenerationTaskParams:
+    task_params = _encrypted_task_params()
+    metadata = task_params.verifiable
+    assert metadata is not None
+    return task_params.model_copy(
+        update={
+            "verifiable": metadata.model_copy(
+                update={
+                    "placement_digest": placement_digest(
+                        bound_instance.instance, metadata.recipient
+                    )
+                }
+            )
+        }
+    )
+
+
 def _encrypted_task_params() -> TextGenerationTaskParams:
     bound_instance = _downstream_bound_instance()
+    recipient = VerifiableRecipient(
+        node_id=NodeId("node-ingress"),
+        provider_id="sha256:" + "b" * 64,
+        key_id=DELIVERY_KEY_ID,
+    )
     return TextGenerationTaskParams(
         model=ModelId("mlx-community/Qwen3-0.6B-8bit"),
         input=[],
@@ -108,12 +191,8 @@ def _encrypted_task_params() -> TextGenerationTaskParams:
         verifiable=VerifiableTaskMetadata(
             protocol_version="verifiable-exo-v1",
             request_id="request-1",
-            placement_digest=placement_digest(bound_instance.instance),
-            recipient=VerifiableRecipient(
-                node_id=NodeId("node-ingress"),
-                provider_id="sha256:" + "b" * 64,
-                key_id=DELIVERY_KEY_ID,
-            ),
+            placement_digest=placement_digest(bound_instance.instance, recipient),
+            recipient=recipient,
             encrypted_input=VerifiableEncryptedInput(
                 scheme="X25519-HKDF-SHA256-AES256GCM",
                 ephemeral_public_key="not-loaded-by-downstream",
@@ -122,6 +201,37 @@ def _encrypted_task_params() -> TextGenerationTaskParams:
             ),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("non_pipeline", "pure pipeline"),
+        ("non_contiguous_rank", "contiguous device ranks"),
+        ("inconsistent_world_size", "common world size"),
+        ("first_layer_not_rank_zero", "first layer must use device rank zero"),
+        ("multiple_first_layers", "exactly one first layer"),
+    ],
+)
+def test_runtime_rejects_invalid_private_prompt_placement(
+    case: Literal[
+        "non_pipeline",
+        "non_contiguous_rank",
+        "inconsistent_world_size",
+        "first_layer_not_rank_zero",
+        "multiple_first_layers",
+    ],
+    expected_error: str,
+) -> None:
+    bound_instance = _invalid_placement(case)
+    task_params = _task_for_bound_instance(bound_instance)
+
+    with pytest.raises(ValueError, match=expected_error):
+        prepare_verifiable_rank_input(
+            task_params,
+            bound_instance,
+            lambda: (_ for _ in ()).throw(AssertionError("key load attempted")),
+        )
 
 
 def test_downstream_rank_never_loads_delivery_key_or_private_input() -> None:
@@ -159,7 +269,7 @@ def test_first_pipeline_rank_decrypts_private_input() -> None:
         request_id="request-1",
         model=ModelId("mlx-community/Qwen3-0.6B-8bit"),
         instance_id=str(bound_instance.instance.instance_id),
-        placement_digest=placement_digest(bound_instance.instance),
+        placement_digest=placement_digest(bound_instance.instance, recipient),
         recipient=recipient,
     )
     private_payload = VerifiablePrivateTaskPayload(
@@ -237,7 +347,7 @@ def test_ingress_rank_renders_decrypted_prompt() -> None:
         request_id="request-render",
         model=ModelId("mlx-community/Qwen3-0.6B-8bit"),
         instance_id=str(bound_instance.instance.instance_id),
-        placement_digest=placement_digest(bound_instance.instance),
+        placement_digest=placement_digest(bound_instance.instance, recipient),
         recipient=recipient,
     )
     payload = VerifiablePrivateTaskPayload(
@@ -309,7 +419,7 @@ def test_ingress_rejects_provider_id_not_derived_from_local_key() -> None:
         request_id="request-forged-provider",
         model=ModelId("mlx-community/Qwen3-0.6B-8bit"),
         instance_id=str(bound_instance.instance.instance_id),
-        placement_digest=placement_digest(bound_instance.instance),
+        placement_digest=placement_digest(bound_instance.instance, forged_recipient),
         recipient=forged_recipient,
     )
     encrypted = encrypt_private_payload(
@@ -344,18 +454,70 @@ def test_ingress_rejects_provider_id_not_derived_from_local_key() -> None:
 def test_execution_receipt_contains_shape_metadata_but_no_private_values() -> None:
     task_params = _encrypted_task_params()
     bound_instance = _downstream_bound_instance()
+    reporting_private_key = generate_delivery_private_key()
+    reporting_public_key = delivery_public_key(reporting_private_key)
 
     receipt = build_verifiable_input_receipt(
         task_params,
         bound_instance,
         VerifiableInputSource.ShapeOnlyDummy,
+        execution_id=CommandId("execution-runtime-test"),
+        delivery_private_key_loader=lambda: reporting_private_key,
         prompt_token_count=23,
     )
 
+    assert receipt.execution_id == CommandId("execution-runtime-test")
     assert receipt.device_rank == 1
+    assert receipt.reporting_provider_id == provider_id_from_public_key(
+        reporting_public_key
+    )
+    assert receipt.reporting_key_id == DELIVERY_KEY_ID
+    assert receipt.recipient_provider_id != receipt.reporting_provider_id
+    assert receipt.recipient_key_id == DELIVERY_KEY_ID
     assert receipt.prompt_token_count == 23
     assert receipt.private_input_accessed is False
     assert receipt.ciphertext_digest.startswith("sha256:")
     serialized = receipt.model_dump_json()
     assert "not-loaded-by-downstream" not in serialized
     assert "input_ids" not in serialized
+
+
+def test_ingress_receipt_reporting_identity_matches_envelope_recipient() -> None:
+    bound_instance = _ingress_bound_instance()
+    reporting_private_key = generate_delivery_private_key()
+    reporting_public_key = delivery_public_key(reporting_private_key)
+    provider_id = provider_id_from_public_key(reporting_public_key)
+    recipient = VerifiableRecipient(
+        node_id=bound_instance.bound_node_id,
+        provider_id=provider_id,
+        key_id=DELIVERY_KEY_ID,
+    )
+    task_params = _encrypted_task_params()
+    metadata = task_params.verifiable
+    assert metadata is not None
+    task_params = task_params.model_copy(
+        update={
+            "verifiable": metadata.model_copy(
+                update={
+                    "recipient": recipient,
+                    "placement_digest": placement_digest(
+                        bound_instance.instance, recipient
+                    ),
+                }
+            )
+        }
+    )
+
+    receipt = build_verifiable_input_receipt(
+        task_params,
+        bound_instance,
+        VerifiableInputSource.DecryptedEnvelope,
+        execution_id=CommandId("execution-ingress-test"),
+        delivery_private_key_loader=lambda: reporting_private_key,
+        prompt_token_count=23,
+    )
+
+    assert receipt.reporting_provider_id == provider_id
+    assert receipt.reporting_key_id == DELIVERY_KEY_ID
+    assert receipt.recipient_provider_id == provider_id
+    assert receipt.recipient_key_id == DELIVERY_KEY_ID

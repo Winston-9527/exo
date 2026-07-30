@@ -510,9 +510,12 @@ def apply_verifiable_input_prepared(
 ) -> State:
     receipt = event.receipt
     existing = list(state.verifiable_receipts.get(receipt.request_id, ()))
-    by_rank = {item.device_rank: item for item in existing}
-    by_rank[receipt.device_rank] = receipt
-    updated = tuple(by_rank[rank] for rank in sorted(by_rank))
+    by_execution_rank = {
+        (item.execution_id, item.device_rank): item for item in existing
+    }
+    receipt_key = (receipt.execution_id, receipt.device_rank)
+    by_execution_rank[receipt_key] = receipt
+    updated = tuple(by_execution_rank[key] for key in sorted(by_execution_rank))
     return state.model_copy(
         update={
             "verifiable_receipts": {
