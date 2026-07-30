@@ -1,6 +1,7 @@
 """Requester-side deterministic quality comparison through public EXO APIs."""
 
 import hashlib
+from typing import cast
 
 import httpx
 import pytest
@@ -10,10 +11,10 @@ from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.chunks import TokenChunk
 from exo.shared.types.common import CommandId, NodeId
-from exo.shared.types.events import ChunkGenerated, TaskCreated
+from exo.shared.types.events import ChunkGenerated, TaskCreated, TaskStatusUpdated
 from exo.shared.types.memory import Memory
 from exo.shared.types.state import State
-from exo.shared.types.tasks import TaskId
+from exo.shared.types.tasks import TaskId, TaskStatus
 from exo.shared.types.tasks import TextGeneration as TextGenerationTask
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.verifiable import (
@@ -30,7 +31,9 @@ from exo.verifiable.identity import DELIVERY_KEY_ID, provider_id_from_public_key
 from exo.verifiable.quality_check import (
     QualityCheckConfig,
     QualityCheckError,
+    _fetch_events,  # pyright: ignore[reportPrivateUsage]
     _task_instance_for_command,  # pyright: ignore[reportPrivateUsage]
+    _token_ids_for_command,  # pyright: ignore[reportPrivateUsage]
     run_quality_check,
 )
 
@@ -99,7 +102,10 @@ def _chat_response(command_id: str) -> dict[str, object]:
 
 
 def _events(
-    instance_id: InstanceId, *, baseline_instance_id: InstanceId | None = None
+    instance_id: InstanceId,
+    *,
+    baseline_instance_id: InstanceId | None = None,
+    complete: bool = True,
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     for command_id in ("baseline-command", "verifiable-command"):
@@ -122,10 +128,10 @@ def _events(
         # through the master and both workers. Every copy must bind to the same
         # instance, but duplicate copies are not ambiguous by themselves.
         events.extend([created.model_dump(mode="json")] * 3)
-        for text, token_id, is_final in (
-            ("same ", 101, False),
-            ("answer", 202, True),
-        ):
+        chunks = [("same ", 101, False)]
+        if complete:
+            chunks.append(("answer", 202, True))
+        for text, token_id, is_final in chunks:
             event = ChunkGenerated(
                 command_id=CommandId(command_id),
                 chunk=TokenChunk(
@@ -137,7 +143,100 @@ def _events(
                 ),
             )
             events.append(event.model_dump(mode="json"))
+        if complete:
+            events.append(
+                TaskStatusUpdated(
+                    task_id=task_id,
+                    task_status=TaskStatus.Complete,
+                ).model_dump(mode="json")
+            )
     return events
+
+
+def test_event_polling_waits_past_a_shared_nonterminal_token_prefix() -> None:
+    request_count = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        assert request.url.path == "/events"
+        request_count += 1
+        return httpx.Response(
+            200,
+            json=_events(
+                InstanceId("quality-instance"),
+                complete=request_count > 1,
+            ),
+        )
+
+    config = QualityCheckConfig(
+        prompt=PROMPT,
+        events_timeout_seconds=0.1,
+        events_poll_interval_seconds=0.001,
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(handle), base_url="http://control.test"
+    ) as client:
+        events = _fetch_events(
+            client,
+            config,
+            command_ids=("baseline-command", "verifiable-command"),
+        )
+
+    assert request_count == 2
+    assert _token_ids_for_command(events, "baseline-command") == [101, 202]
+    assert _token_ids_for_command(events, "verifiable-command") == [101, 202]
+
+
+def test_event_polling_rejects_multiple_unique_terminal_chunks() -> None:
+    events = _events(InstanceId("quality-instance"))
+    events.append(
+        ChunkGenerated(
+            command_id=CommandId("baseline-command"),
+            chunk=TokenChunk(
+                model=MODEL,
+                text="unexpected second ending",
+                token_id=303,
+                usage=None,
+                finish_reason="length",
+            ),
+        ).model_dump(mode="json")
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/events"
+        return httpx.Response(200, json=events)
+
+    config = QualityCheckConfig(prompt=PROMPT, events_timeout_seconds=0.0)
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(handle), base_url="http://control.test"
+        ) as client,
+        pytest.raises(QualityCheckError, match="terminal"),
+    ):
+        _fetch_events(client, config, command_ids=("baseline-command",))
+
+
+def test_token_event_id_cannot_hide_a_conflicting_payload() -> None:
+    events = cast(JsonValue, _events(InstanceId("quality-instance")))
+    assert isinstance(events, list)
+    baseline_chunks = [
+        parsed
+        for event in events
+        if isinstance(event, dict)
+        and "ChunkGenerated" in event
+        and (parsed := ChunkGenerated.model_validate(event)).command_id
+        == CommandId("baseline-command")
+    ]
+    assert len(baseline_chunks) == 2
+    original = baseline_chunks[0]
+    assert isinstance(original.chunk, TokenChunk)
+    conflicting = original.model_copy(
+        update={"chunk": original.chunk.model_copy(update={"token_id": 999})}
+    )
+    events.append(conflicting.model_dump(mode="json"))
+
+    with pytest.raises(QualityCheckError, match="event id"):
+        _token_ids_for_command(events, "baseline-command")
 
 
 def test_task_instance_binding_deduplicates_only_consistent_event_copies() -> None:
@@ -201,6 +300,7 @@ def test_task_instance_binding_deduplicates_only_consistent_event_copies() -> No
         "reporting_fingerprint",
         "reporting_key_id",
         "baseline_instance",
+        "postflight_instance",
     ],
 )
 def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
@@ -221,12 +321,23 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
     )
     encrypted_wire_bodies: list[str] = []
     encrypted_requests: list[VerifiableChatCompletionRequest] = []
+    events_request_count = 0
+    state_request_count = 0
 
     def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal events_request_count, state_request_count
         if request.method == "GET" and request.url.path == "/state":
             assert request.url.host == "control.test"
+            state_request_count += 1
+            state_instance = (
+                instance.model_copy(
+                    update={"ephemeral_port": instance.ephemeral_port + 1}
+                )
+                if tampered_binding == "postflight_instance" and state_request_count > 1
+                else instance
+            )
             state = State(
-                instances={instance.instance_id: instance},
+                instances={state_instance.instance_id: state_instance},
                 node_backends={
                     NodeId("node-ingress"): [Backend.MlxCuda],
                     NodeId("node-downstream"): [Backend.MlxMetal],
@@ -254,6 +365,11 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
             return httpx.Response(200, json=_chat_response("verifiable-command"))
         if request.method == "GET" and request.url.path == "/events":
             assert request.url.host == "control.test"
+            events_request_count += 1
+            if tampered_binding is None and events_request_count == 1:
+                # A completed chat response can arrive before replicated
+                # TaskCreated/ChunkGenerated evidence reaches this API node.
+                return httpx.Response(200, json=[])
             return httpx.Response(
                 200,
                 json=_events(
@@ -380,21 +496,32 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
             return httpx.Response(200, json=audit.model_dump(mode="json"))
         return httpx.Response(404)
 
+    quality_config = QualityCheckConfig(
+        model=MODEL,
+        prompt=PROMPT,
+        request_id="quality-request",
+        instance_id=instance.instance_id,
+        expected_instance=instance,
+        ingress_url="http://ingress.test:52415",
+        max_output_tokens=16,
+        seed=42,
+        events_timeout_seconds=0.1,
+        events_poll_interval_seconds=0.001,
+        audit_timeout_seconds=0.0,
+    )
     transport = httpx.MockTransport(handle)
+    if tampered_binding == "postflight_instance":
+        with (
+            httpx.Client(transport=transport, base_url="http://control.test") as client,
+            pytest.raises(QualityCheckError, match="frozen instance"),
+        ):
+            run_quality_check(client, quality_config)
+        assert state_request_count == 2
+        assert len(encrypted_wire_bodies) == 1
+        return
+
     with httpx.Client(transport=transport, base_url="http://control.test") as client:
-        report = run_quality_check(
-            client,
-            QualityCheckConfig(
-                model=MODEL,
-                prompt=PROMPT,
-                request_id="quality-request",
-                instance_id=instance.instance_id,
-                ingress_url="http://ingress.test:52415",
-                max_output_tokens=16,
-                seed=42,
-                audit_timeout_seconds=0.0,
-            ),
-        )
+        report = run_quality_check(client, quality_config)
 
     serialized = report.model_dump_json()
     expected_pass = tampered_binding is None
@@ -423,6 +550,9 @@ def test_quality_check_rejects_unbound_audit_receipts_without_reporting_prompt(
     assert PROMPT not in serialized
     assert PROMPT not in "".join(encrypted_wire_bodies)
     assert report.prompt.sha256.startswith("sha256:")
+    if tampered_binding is None:
+        assert events_request_count == 2
+        assert state_request_count == 2
 
 
 def test_quality_check_rejects_ambiguous_standard_placement() -> None:
@@ -458,6 +588,45 @@ def test_quality_check_rejects_ambiguous_standard_placement() -> None:
                 model=MODEL,
                 prompt=PROMPT,
                 instance_id=selected.instance_id,
+            ),
+        )
+
+    assert post_count == 0
+
+
+def test_quality_check_rejects_frozen_instance_drift_before_transmitting() -> None:
+    frozen = _instance()
+    drifted = frozen.model_copy(update={"ephemeral_port": frozen.ephemeral_port + 1})
+    post_count = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/verifiable/audit/frozen"
+        ):
+            return httpx.Response(404)
+        if request.method == "GET" and request.url.path == "/state":
+            state = State(instances={drifted.instance_id: drifted})
+            return httpx.Response(200, json=state.model_dump(mode="json"))
+        if request.method == "POST":
+            post_count += 1
+        return httpx.Response(404)
+
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(handle), base_url="http://control.test"
+        ) as client,
+        pytest.raises(QualityCheckError, match="frozen instance"),
+    ):
+        run_quality_check(
+            client,
+            QualityCheckConfig(
+                model=MODEL,
+                prompt=PROMPT,
+                request_id="frozen",
+                instance_id=frozen.instance_id,
+                expected_instance=frozen,
             ),
         )
 

@@ -27,6 +27,7 @@ from exo.shared.types.verifiable import (
     VerifiableAuditResponse,
     VerifiableChatCompletionRequest,
     VerifiableGenerationParams,
+    VerifiableInputReceipt,
     VerifiableProviderIdentity,
 )
 from exo.shared.types.worker.instances import Instance, InstanceId
@@ -50,9 +51,12 @@ class QualityCheckConfig(FrozenModel):
     prompt: str
     request_id: str = Field(default_factory=lambda: f"quality-{uuid4()}")
     instance_id: InstanceId | None = None
+    expected_instance: Instance | None = None
     ingress_url: str | None = None
     max_output_tokens: int = Field(default=32, gt=0)
     seed: int = 42
+    events_timeout_seconds: float = Field(default=15.0, ge=0.0)
+    events_poll_interval_seconds: float = Field(default=0.2, gt=0.0)
     audit_timeout_seconds: float = Field(default=15.0, ge=0.0)
     audit_poll_interval_seconds: float = Field(default=0.2, gt=0.0)
 
@@ -94,6 +98,7 @@ class AuditEvidence(FrozenModel):
     ingress_only_private_access: bool
     private_input_nodes: list[NodeId]
     shape_only_nodes: list[NodeId]
+    receipts: list[VerifiableInputReceipt]
 
 
 class QualityCheckReport(FrozenModel):
@@ -137,6 +142,8 @@ def _select_instance(state: State, config: QualityCheckConfig) -> Instance:
     instance = matches[0]
     if config.instance_id is not None and instance.instance_id != config.instance_id:
         raise QualityCheckError("The requested instance does not exist for this model")
+    if config.expected_instance is not None and instance != config.expected_instance:
+        raise QualityCheckError("Live placement does not match the frozen instance")
     return instance
 
 
@@ -232,6 +239,10 @@ def _token_ids_for_command(events: JsonValue, command_id: str) -> list[int]:
     if not isinstance(events, list):
         raise QualityCheckError("EXO /events did not return a list")
     token_ids: list[int] = []
+    terminal_chunk_count = 0
+    saw_non_token_generation_chunk = False
+    last_unique_token_was_terminal = False
+    seen_chunk_events: dict[str, str] = {}
     for untyped_event in events:
         if not isinstance(untyped_event, dict):
             continue
@@ -243,17 +254,111 @@ def _token_ids_for_command(events: JsonValue, command_id: str) -> list[int]:
         chunk_container = event.get("chunk")
         if not isinstance(chunk_container, dict):
             continue
+        canonical_event = json.dumps(
+            event,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        event_id = event.get("event_id")
+        event_identity = (
+            f"event-id:{event_id}" if isinstance(event_id, str) else canonical_event
+        )
+        previous_event = seen_chunk_events.get(event_identity)
+        if previous_event is not None:
+            if previous_event != canonical_event:
+                raise QualityCheckError(
+                    "A token event id was reused for a conflicting payload"
+                )
+            continue
+        seen_chunk_events[event_identity] = canonical_event
         chunk = chunk_container.get("TokenChunk")
         if not isinstance(chunk, dict):
+            if any(
+                isinstance(chunk_container.get(chunk_type), dict)
+                for chunk_type in ("ErrorChunk", "ToolCallChunk")
+            ):
+                saw_non_token_generation_chunk = True
             continue
         token_id = _field(chunk, "token_id", "tokenId")
-        if isinstance(token_id, int) and not isinstance(token_id, bool):
-            token_ids.append(token_id)
+        if not isinstance(token_id, int) or isinstance(token_id, bool):
+            raise QualityCheckError("TokenChunk contained an invalid token id")
+        token_ids.append(token_id)
+        last_unique_token_was_terminal = (
+            _field(chunk, "finish_reason", "finishReason") is not None
+        )
+        if last_unique_token_was_terminal:
+            terminal_chunk_count += 1
     if not token_ids:
         raise QualityCheckError(
             "No TokenChunk events were found for a completed request"
         )
+    if saw_non_token_generation_chunk:
+        raise QualityCheckError(
+            "Quality comparison requires token output without error/tool chunks"
+        )
+    if terminal_chunk_count != 1:
+        raise QualityCheckError(
+            "A completed request must have exactly one unique terminal TokenChunk"
+        )
+    if not last_unique_token_was_terminal:
+        raise QualityCheckError("Token output continued after its terminal chunk")
+    _require_completed_task(events, command_id)
     return token_ids
+
+
+def _task_ids_for_command(events: JsonValue, command_id: str) -> set[str]:
+    if not isinstance(events, list):
+        raise QualityCheckError("EXO /events did not return a list")
+    task_ids: set[str] = set()
+    for untyped_event in events:
+        if not isinstance(untyped_event, dict):
+            continue
+        created = untyped_event.get("TaskCreated")
+        if not isinstance(created, dict):
+            continue
+        task_container = created.get("task")
+        if not isinstance(task_container, dict):
+            continue
+        task = task_container.get("TextGeneration")
+        if not isinstance(task, dict):
+            continue
+        if _field(task, "command_id", "commandId") != command_id:
+            continue
+        task_id = _field(created, "task_id", "taskId")
+        if isinstance(task_id, str):
+            task_ids.add(task_id)
+    return task_ids
+
+
+def _require_completed_task(events: JsonValue, command_id: str) -> None:
+    if not isinstance(events, list):
+        raise QualityCheckError("EXO /events did not return a list")
+    task_ids = _task_ids_for_command(events, command_id)
+    if len(task_ids) != 1:
+        raise QualityCheckError(
+            "A command must bind to exactly one unique text-generation task"
+        )
+    task_id = next(iter(task_ids))
+    statuses: set[str] = set()
+    for untyped_event in events:
+        if not isinstance(untyped_event, dict):
+            continue
+        updated = untyped_event.get("TaskStatusUpdated")
+        if not isinstance(updated, dict):
+            continue
+        if _field(updated, "task_id", "taskId") != task_id:
+            continue
+        status = _field(updated, "task_status", "taskStatus")
+        if isinstance(status, str):
+            statuses.add(status)
+    failed_statuses = statuses.intersection({"Failed", "TimedOut", "Cancelled"})
+    if failed_statuses:
+        raise QualityCheckError("The text-generation task terminated unsuccessfully")
+    if "Complete" not in statuses:
+        raise QualityCheckError(
+            "The text-generation task has no complete terminal status"
+        )
 
 
 def _task_instance_for_command(events: JsonValue, command_id: str) -> InstanceId:
@@ -462,6 +567,7 @@ def _audit_evidence(
         ingress_only_private_access=ingress_only,
         private_input_nodes=private_nodes,
         shape_only_nodes=dummy_nodes,
+        receipts=audit.receipts,
     )
 
 
@@ -494,6 +600,35 @@ def _fetch_audit(
                 receipts=[],
             )
         time.sleep(config.audit_poll_interval_seconds)
+
+
+def _fetch_events(
+    client: httpx.Client,
+    config: QualityCheckConfig,
+    *,
+    command_ids: Sequence[str],
+) -> JsonValue:
+    deadline = time.monotonic() + config.events_timeout_seconds
+    latest_error: QualityCheckError | None = None
+    while True:
+        response = client.get("/events")
+        response.raise_for_status()
+        events = _decode_json(response)
+        if not isinstance(events, list):
+            raise QualityCheckError("EXO /events did not return a list")
+        try:
+            for command_id in command_ids:
+                _token_ids_for_command(events, command_id)
+                _task_instance_for_command(events, command_id)
+        except QualityCheckError as error:
+            latest_error = error
+        else:
+            return events
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            raise latest_error
+        time.sleep(min(config.events_poll_interval_seconds, remaining_seconds))
 
 
 def _assert_request_id_fresh(client: httpx.Client, request_id: str) -> None:
@@ -572,9 +707,11 @@ def run_quality_check(
     )
     verifiable_command_id, verifiable_text = _chat_result(verifiable_response)
 
-    events_response = client.get("/events")
-    events_response.raise_for_status()
-    events = _decode_json(events_response)
+    events = _fetch_events(
+        client,
+        config,
+        command_ids=(baseline_command_id, verifiable_command_id),
+    )
     baseline_tokens = _token_ids_for_command(events, baseline_command_id)
     verifiable_tokens = _token_ids_for_command(events, verifiable_command_id)
     baseline_instance_id = _task_instance_for_command(events, baseline_command_id)
@@ -594,13 +731,14 @@ def run_quality_check(
         final_text_exact=baseline_text == verifiable_text,
         first_token_mismatch_index=first_mismatch,
     )
+    raw_audit = _fetch_audit(
+        client,
+        config,
+        expected_ranks=expected_ranks,
+        execution_id=CommandId(verifiable_command_id),
+    )
     audit = _audit_evidence(
-        _fetch_audit(
-            client,
-            config,
-            expected_ranks=expected_ranks,
-            execution_id=CommandId(verifiable_command_id),
-        ),
+        raw_audit,
         instance=instance,
         encrypted_request=encrypted_request,
         identity=identity,
@@ -608,6 +746,15 @@ def run_quality_check(
         expected_world_size=expected_ranks,
         verifiable_execution_id=CommandId(verifiable_command_id),
     )
+
+    postflight_state_response = client.get("/state")
+    postflight_state_response.raise_for_status()
+    postflight_state = State.model_validate_json(postflight_state_response.content)
+    postflight_instance = _select_instance(postflight_state, config)
+    if postflight_instance != instance:
+        raise QualityCheckError(
+            "Live placement changed while quality evidence was collected"
+        )
 
     baseline_evidence = GenerationEvidence(
         command_id=baseline_command_id,
@@ -674,6 +821,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-output-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--events-timeout", type=float, default=15.0)
     parser.add_argument("--audit-timeout", type=float, default=15.0)
     return parser
 
@@ -703,6 +851,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ingress_url=ingress_url,
         max_output_tokens=cast(int, args.max_output_tokens),
         seed=cast(int, args.seed),
+        events_timeout_seconds=cast(float, args.events_timeout),
         audit_timeout_seconds=cast(float, args.audit_timeout),
     )
     try:
