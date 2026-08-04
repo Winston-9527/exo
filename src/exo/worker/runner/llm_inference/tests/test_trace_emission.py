@@ -21,8 +21,7 @@ from exo.shared.types.text_generation import (
 )
 from exo.shared.types.worker.instances import InstanceId
 from exo.shared.types.worker.runner_response import GenerationResponse
-from exo.utils.channels import MpReceiver, MpSender, mp_channel
-from exo.worker.engines.mlx import builder as mlx_builder
+from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.mlx import tracing as mlx_tracing
 from exo.worker.runner.llm_inference import batch_generator as mlx_batch_generator
 from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
