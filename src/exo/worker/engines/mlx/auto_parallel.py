@@ -67,6 +67,7 @@ from exo.worker.engines.mlx.boundary_hook import (
     BoundaryHook,
     maybe_hook_activation,
 )
+from exo.worker.engines.mlx.boundary_hook_config import boundary_hook_from_env
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -326,7 +327,12 @@ def pipeline_auto_parallel(
         mx.clear_cache()
         yield ModelLoadingResponse(layers_loaded=i, total=total)
 
-    layers[0] = PipelineFirstLayer(layers[0], device_rank, group=group)
+    layers[0] = PipelineFirstLayer(
+        layers[0],
+        device_rank,
+        group=group,
+        boundary_hook=boundary_hook_from_env(),
+    )
     layers[-1] = PipelineLastLayer(
         layers[-1],
         device_rank,
