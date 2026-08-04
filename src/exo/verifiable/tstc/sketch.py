@@ -55,10 +55,10 @@ def _selected_tokens(row_count: int, token_indices: tuple[int, ...] | None, sele
     )
 
 
-def _projection(hidden_size: int, dimension: int, projection_seed: int | None, metric: str) -> np.ndarray:
+def _projection(hidden_size: int, dimension: int, projection_seed: int | None, purpose: str) -> np.ndarray:
     if projection_seed is None:
         raise ValueError("projected verifier requires a projection seed")
-    projection = _rng(projection_seed, f"projection:{metric}").normal(
+    projection = _rng(projection_seed, purpose).normal(
         loc=0.0,
         scale=1.0 / np.sqrt(dimension),
         size=(hidden_size, dimension),
@@ -106,7 +106,7 @@ def capture_projected_cosine_sketch(
     reference_rows = reference_input.reshape(-1, hidden_size)
     candidate_rows = candidate_input.reshape(-1, hidden_size)
     indices = _selected_tokens(reference_rows.shape[0], token_indices, selection_seed)
-    projection = _projection(hidden_size, projection_dimension, projection_seed, "projcos")
+    projection = _projection(hidden_size, projection_dimension, projection_seed, f"projection:projcos{projection_dimension}")
     selected_tokens = tuple(int(index) for index in indices)
     digest = _projection_digest(projection)
     with np.errstate(over="ignore", invalid="ignore"):
@@ -148,7 +148,7 @@ def capture_projected_scalar_sketch(
     reference_rows = reference_input.reshape(-1, hidden_size)
     candidate_rows = candidate_input.reshape(-1, hidden_size)
     indices = _selected_tokens(reference_rows.shape[0], token_indices, selection_seed)
-    projection = _projection(hidden_size, 1, projection_seed, "projscalar1_abs")
+    projection = _projection(hidden_size, 1, projection_seed, "projection:projscalar1_abs")
     selected_tokens = tuple(int(index) for index in indices)
     digest = _projection_digest(projection)
     with np.errstate(over="ignore", invalid="ignore"):
