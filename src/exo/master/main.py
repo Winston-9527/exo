@@ -263,6 +263,17 @@ class Master:
                                 )
                             )
                             self.command_task_mapping[command.command_id] = task_id
+
+                            if EXO_TRACING_ENABLED:
+                                selected_instance = self.state.instances.get(
+                                    decode_instance_id
+                                )
+                                if selected_instance:
+                                    ranks = set(
+                                        shard.device_rank
+                                        for shard in selected_instance.shard_assignments.runner_to_shard.values()
+                                    )
+                                    self._expected_ranks[task_id] = ranks
                         case ImageGeneration():
                             for instance in self.state.instances.values():
                                 if (
