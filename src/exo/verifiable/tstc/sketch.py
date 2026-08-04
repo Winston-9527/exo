@@ -8,9 +8,11 @@ controlled harness reconcile on the same boundary tensors.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 
 
 def _rng(seed: int, purpose: str) -> np.random.Generator:
@@ -43,28 +45,32 @@ def _require_finite(*values: np.ndarray) -> None:
         raise ValueError("non-finite verifier arithmetic is forbidden")
 
 
-def _selected_tokens(row_count: int, token_indices: tuple[int, ...] | None, selection_seed: int) -> np.ndarray:
+def _selected_tokens(row_count: int, token_indices: tuple[int, ...] | None, selection_seed: int) -> NDArray[np.int64]:
     if token_indices is not None:
         return np.asarray(token_indices, dtype=np.int64)
-    return np.sort(
-        _rng(selection_seed, "tokens").choice(
-            row_count,
-            size=min(16, row_count),
-            replace=False,
-        )
+    return np.asarray(
+        np.sort(
+            _rng(selection_seed, "tokens").choice(
+                row_count,
+                size=min(16, row_count),
+                replace=False,
+            )
+        ),
+        dtype=np.int64,
     )
 
 
-def _projection(hidden_size: int, dimension: int, projection_seed: int | None, purpose: str) -> np.ndarray:
+def _projection(hidden_size: int, dimension: int, projection_seed: int | None, purpose: str) -> NDArray[np.float64]:
     if projection_seed is None:
         raise ValueError("projected verifier requires a projection seed")
+    scale: float = 1.0 / math.sqrt(float(dimension))
     projection = _rng(projection_seed, purpose).normal(
         loc=0.0,
-        scale=1.0 / np.sqrt(dimension),
+        scale=scale,
         size=(hidden_size, dimension),
     )
     _require_finite(projection)
-    return projection
+    return np.asarray(projection, dtype=np.float64)
 
 
 def _projection_digest(projection: np.ndarray) -> str:
@@ -72,7 +78,9 @@ def _projection_digest(projection: np.ndarray) -> str:
     return hashlib.sha256(canonical.tobytes()).hexdigest()
 
 
-def _validated_tensors(reference: np.ndarray, candidate: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _validated_tensors(
+    reference: np.ndarray, candidate: np.ndarray
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     reference_input = np.asarray(reference)
     candidate_input = np.asarray(candidate)
     if (
@@ -84,7 +92,10 @@ def _validated_tensors(reference: np.ndarray, candidate: np.ndarray) -> tuple[np
         raise ValueError("reference and candidate must contain finite numeric values")
     if reference_input.shape != candidate_input.shape:
         raise ValueError("reference and candidate must have identical shape")
-    return np.asarray(reference_input, dtype=np.float64), np.asarray(candidate_input, dtype=np.float64)
+    return (
+        np.asarray(reference_input, dtype=np.float64),
+        np.asarray(candidate_input, dtype=np.float64),
+    )
 
 
 def capture_projected_cosine_sketch(
@@ -102,28 +113,37 @@ def capture_projected_cosine_sketch(
     and reports ``mean(1 - cos)`` across selected tokens.
     """
     reference_input, candidate_input = _validated_tensors(reference, candidate)
-    hidden_size = reference_input.shape[-1]
-    reference_rows = reference_input.reshape(-1, hidden_size)
-    candidate_rows = candidate_input.reshape(-1, hidden_size)
-    indices = _selected_tokens(reference_rows.shape[0], token_indices, selection_seed)
-    projection = _projection(hidden_size, projection_dimension, projection_seed, f"projection:projcos{projection_dimension}")
-    selected_tokens = tuple(int(index) for index in indices)
+    hidden_size: int = reference_input.shape[-1]  # type: ignore[reportAny]
+    reference_rows = np.asarray(reference_input.reshape(-1, hidden_size), dtype=np.float64)
+    candidate_rows = np.asarray(candidate_input.reshape(-1, hidden_size), dtype=np.float64)
+    indices = _selected_tokens(len(reference_rows), token_indices, selection_seed)
+    projection = np.asarray(
+        _projection(hidden_size, projection_dimension, projection_seed, f"projection:projcos{projection_dimension}"),
+        dtype=np.float64,
+    )
+    selected_tokens = tuple(int(index) for index in indices)  # type: ignore[reportAny]
     digest = _projection_digest(projection)
     with np.errstate(over="ignore", invalid="ignore"):
-        reference_projected = reference_rows[indices] @ projection
-        candidate_projected = candidate_rows[indices] @ projection
-        reference_norm = np.linalg.norm(reference_projected, axis=1, keepdims=True)
-        candidate_norm = np.linalg.norm(candidate_projected, axis=1, keepdims=True)
+        reference_projected = np.asarray(reference_rows[indices] @ projection, dtype=np.float64)
+        candidate_projected = np.asarray(candidate_rows[indices] @ projection, dtype=np.float64)
+        reference_norm = np.asarray(np.linalg.norm(reference_projected, axis=1, keepdims=True), dtype=np.float64)
+        candidate_norm = np.asarray(np.linalg.norm(candidate_projected, axis=1, keepdims=True), dtype=np.float64)
     _require_finite(reference_projected, candidate_projected, reference_norm, candidate_norm)
-    reference_unit = np.divide(
-        reference_projected, reference_norm, out=np.zeros_like(reference_projected), where=reference_norm > 0.0
+    reference_unit = np.asarray(
+        np.divide(
+            reference_projected, reference_norm, out=np.zeros_like(reference_projected), where=reference_norm > 0.0
+        ),
+        dtype=np.float64,
     )
-    candidate_unit = np.divide(
-        candidate_projected, candidate_norm, out=np.zeros_like(candidate_projected), where=candidate_norm > 0.0
+    candidate_unit = np.asarray(
+        np.divide(
+            candidate_projected, candidate_norm, out=np.zeros_like(candidate_projected), where=candidate_norm > 0.0
+        ),
+        dtype=np.float64,
     )
-    similarities = np.sum(reference_unit * candidate_unit, axis=1)
-    both_zero = (reference_norm[:, 0] == 0.0) & (candidate_norm[:, 0] == 0.0)
-    identical_projection = np.all(reference_projected == candidate_projected, axis=1)
+    similarities = np.asarray(np.sum(reference_unit * candidate_unit, axis=1), dtype=np.float64)
+    both_zero = np.asarray((reference_norm[:, 0] == 0.0) & (candidate_norm[:, 0] == 0.0))  # type: ignore[reportAny]
+    identical_projection = np.asarray(np.all(reference_projected == candidate_projected, axis=1))  # type: ignore[reportAny]
     similarities[both_zero | identical_projection] = 1.0
     _require_finite(similarities)
     score = float(np.mean(1.0 - np.clip(similarities, -1.0, 1.0)))
@@ -144,17 +164,20 @@ def capture_projected_scalar_sketch(
     absolute gap, so it remains norm-sensitive (scale is visible).
     """
     reference_input, candidate_input = _validated_tensors(reference, candidate)
-    hidden_size = reference_input.shape[-1]
-    reference_rows = reference_input.reshape(-1, hidden_size)
-    candidate_rows = candidate_input.reshape(-1, hidden_size)
-    indices = _selected_tokens(reference_rows.shape[0], token_indices, selection_seed)
-    projection = _projection(hidden_size, 1, projection_seed, "projection:projscalar1_abs")
-    selected_tokens = tuple(int(index) for index in indices)
+    hidden_size: int = reference_input.shape[-1]  # type: ignore[reportAny]
+    reference_rows = np.asarray(reference_input.reshape(-1, hidden_size), dtype=np.float64)
+    candidate_rows = np.asarray(candidate_input.reshape(-1, hidden_size), dtype=np.float64)
+    indices = _selected_tokens(len(reference_rows), token_indices, selection_seed)
+    projection = np.asarray(
+        _projection(hidden_size, 1, projection_seed, "projection:projscalar1_abs"),
+        dtype=np.float64,
+    )
+    selected_tokens = tuple(int(index) for index in indices)  # type: ignore[reportAny]
     digest = _projection_digest(projection)
     with np.errstate(over="ignore", invalid="ignore"):
-        reference_projected = reference_rows[indices] @ projection
-        candidate_projected = candidate_rows[indices] @ projection
-        differences = np.abs(reference_projected - candidate_projected)
+        reference_projected = np.asarray(reference_rows[indices] @ projection, dtype=np.float64)
+        candidate_projected = np.asarray(candidate_rows[indices] @ projection, dtype=np.float64)
+        differences = np.asarray(np.abs(reference_projected - candidate_projected), dtype=np.float64)
     _require_finite(reference_projected, candidate_projected, differences)
     score = float(np.mean(differences))
     return ProjectedSketch(score=score, token_indices=selected_tokens, projection_digest=digest, metric="projscalar1_abs")
@@ -191,17 +214,18 @@ def capture_scalar_sketch(
     if coordinate_indices is not None:
         indices = np.asarray(coordinate_indices, dtype=np.int64)
     else:
+        flat_size = len(reference_flat)
         indices = np.sort(
             _rng(selection_seed, "coordinates").choice(
-                reference_flat.size,
-                size=min(16, reference_flat.size),
+                flat_size,
+                size=min(16, flat_size),
                 replace=False,
             )
         )
-    selected = tuple(int(index) for index in indices)
+    selected = tuple(int(index) for index in indices)  # type: ignore[reportAny]
     with np.errstate(over="ignore", invalid="ignore"):
         differences = np.abs(reference_flat[indices] - candidate_flat[indices])
     if not np.all(np.isfinite(differences)):
         raise ValueError("non-finite sketch arithmetic is forbidden")
-    score = float(np.max(differences))
+    score = float(np.max(differences))  # type: ignore[reportAny]
     return ScalarSketch(score=score, coordinate_indices=selected)

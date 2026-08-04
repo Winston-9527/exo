@@ -29,8 +29,8 @@ sys.path.insert(0, str(_P0E2_SRC))
 
 from accountedge_e2.verifier import (  # noqa: E402
     NORMALIZED_DECISION_RULE,
-    VerifierPolicy,
     Verifier,
+    VerifierPolicy,
 )
 
 pytestmark = pytest.mark.skipif(

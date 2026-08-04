@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from exo.verifiable.tstc.sketch import capture_scalar_sketch
-from exo.verifiable.tstc.verifier import BoundaryVerdict, evaluate_chain
+from exo.verifiable.tstc.verifier import evaluate_chain
 
 
 def test_chain_accepts_when_all_boundaries_within_tolerance() -> None:
