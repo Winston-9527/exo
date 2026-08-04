@@ -10,7 +10,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from exo.verifiable.tstc.sketch import capture_scalar_sketch
+from exo.verifiable.tstc.sketch import (
+    capture_projected_cosine_sketch,
+    capture_projected_scalar_sketch,
+    capture_scalar_sketch,
+)
 
 
 def test_scalar_sketch_captures_max_absolute_gap_at_selected_coordinates() -> None:
@@ -66,3 +70,43 @@ def test_scalar_sketch_seeded_selection_matches_reference_semantics() -> None:
     coords = (3 * 8 + 7,)
     ours = capture_scalar_sketch(reference, candidate, coordinate_indices=coords)
     assert ours.score == pytest.approx(0.1)
+
+
+def test_projected_cosine_sketch_zero_for_identical_tensors() -> None:
+    tensor = np.random.default_rng(0).normal(size=(4, 8)).astype(np.float32)
+    sketch = capture_projected_cosine_sketch(tensor, tensor, projection_dimension=4)
+    assert sketch.score == pytest.approx(0.0)
+
+
+def test_projected_cosine_sketch_detects_direction_change() -> None:
+    reference = np.random.default_rng(1).normal(size=(4, 8)).astype(np.float32)
+    candidate = reference.copy()
+    candidate[1] = -candidate[1]  # flip one token row: direction changes
+    sketch = capture_projected_cosine_sketch(reference, candidate, projection_dimension=4)
+    # One of four rows is anti-parallel (score 2.0), the rest identical (0.0):
+    # mean over 4 selected tokens = 0.5. A direction change must not be near zero.
+    assert sketch.score >= 0.5
+    assert sketch.score > 0.0
+
+
+def test_projected_cosine_sketch_blind_to_global_scale() -> None:
+    """Row normalization makes a global scale perturbation invisible to cosine."""
+    reference = np.random.default_rng(2).normal(size=(4, 8)).astype(np.float32)
+    candidate = reference * 2.0
+    sketch = capture_projected_cosine_sketch(reference, candidate, projection_dimension=4)
+    assert sketch.score == pytest.approx(0.0, abs=1e-6)
+
+
+def test_projected_scalar_sketch_sensitive_to_global_scale() -> None:
+    """The 1-D projected scalar compares absolute gaps, so scale is visible."""
+    reference = np.random.default_rng(3).normal(size=(4, 8)).astype(np.float32)
+    candidate = reference * 2.0
+    sketch = capture_projected_scalar_sketch(reference, candidate, projection_seed=11)
+    assert sketch.score > 0.0
+
+
+def test_projected_sketch_requires_matching_shapes() -> None:
+    reference = np.zeros((4, 8), dtype=np.float32)
+    candidate = np.zeros((4, 7), dtype=np.float32)
+    with pytest.raises(ValueError):
+        capture_projected_cosine_sketch(reference, candidate, projection_dimension=4)
