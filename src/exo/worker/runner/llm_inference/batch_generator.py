@@ -48,6 +48,7 @@ from exo.worker.engines.mlx.generator.verifiable_sync import (
     should_run_debug_prompt_check,
     synchronize_rank_preparation,
 )
+from exo.worker.engines.mlx.tracing import emit_traces_collected
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -204,6 +205,7 @@ class SequentialGenerator(Engine):
 
         except (StopIteration, PrefillCancelled):
             output.append((task.task_id, FinishedResponse()))
+            emit_traces_collected(self.event_sender, task.task_id, self.device_rank)
             self._active = None
             if self._queue:
                 self._start_next()
@@ -529,6 +531,7 @@ class BatchGenerator(Engine):
             # check if original response was terminal and append a Finished()
             if response.finish_reason is not None:
                 output.append((task.task_id, FinishedResponse()))
+                emit_traces_collected(self.event_sender, task.task_id, self.device_rank)
                 del self._active_tasks[uid]
 
         return filter(
