@@ -63,6 +63,10 @@ from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.worker.engines.mlx.boundary_hook import (
+    BoundaryHook,
+    maybe_hook_activation,
+)
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -117,17 +121,37 @@ class CustomMlxLayer(nn.Module):
                 return getattr(original_layer, name)
 
 
+def _apply_boundary_hook(
+    x: mx.array,
+    hook: BoundaryHook,
+    rank: int,
+) -> mx.array:
+    """Run capture/injection on a received boundary activation (mx -> numpy -> mx).
+
+    Converts to a float32 numpy view for the hook, then converts the (possibly
+    replaced) result back to an mx.array with the same dtype.
+    """
+    import numpy as np
+
+    dtype = x.dtype
+    activation = np.asarray(x, dtype=np.float32)
+    hooked = maybe_hook_activation(activation, hook=hook, rank=rank)
+    return mx.array(hooked).astype(dtype)
+
+
 class PipelineFirstLayer(CustomMlxLayer):
     def __init__(
         self,
         original_layer: _LayerCallable,
         r: int,
         group: mx.distributed.Group,
+        boundary_hook: BoundaryHook | None = None,
     ):
         super().__init__(original_layer)
         self.r: int = r
         self.group = group
         self.is_prefill: bool = False
+        self.boundary_hook = boundary_hook
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         if self.r != 0:
@@ -136,6 +160,8 @@ class PipelineFirstLayer(CustomMlxLayer):
             mx.eval(x)
             x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
             mx.eval(x)
+            if self.boundary_hook is not None:
+                x = _apply_boundary_hook(x, self.boundary_hook, self.r)
         return self.original_layer(x, *args, **kwargs)
 
 
