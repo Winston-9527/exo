@@ -135,7 +135,9 @@ def _apply_boundary_hook(
     import numpy as np
 
     dtype = x.dtype
-    activation = np.asarray(x, dtype=np.float32)
+    # bf16/fp16 mx arrays have a broken numpy buffer protocol; upcast via mx
+    # first so np.array sees a compatible dtype.
+    activation = np.array(x.astype(mx.float32))
     hooked = maybe_hook_activation(activation, hook=hook, rank=rank)
     return mx.array(hooked).astype(dtype)
 

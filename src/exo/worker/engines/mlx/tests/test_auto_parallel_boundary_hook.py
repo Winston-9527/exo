@@ -44,3 +44,35 @@ def test_apply_hook_captures_honest_activation_before_inject() -> None:
     assert len(captured) == 1
     assert np.allclose(captured[0], np.asarray(x))  # captured the honest tensor
     assert np.allclose(np.asarray(result), tampered)  # consumed the injected one
+
+
+def test_apply_hook_bf16_preserves_activation() -> None:
+    """bf16 mx arrays must convert without the PEP 3118 buffer error."""
+    x = mx.array(
+        np.random.default_rng(3).normal(size=(4, 8)).astype(np.float32)
+    ).astype(mx.bfloat16)
+    result = _apply_boundary_hook(x, BoundaryHook(), rank=1)
+    assert result.dtype == mx.bfloat16
+    assert np.allclose(
+        np.array(result.astype(mx.float32)), np.array(x.astype(mx.float32))
+    )
+
+
+def test_apply_hook_bf16_injects_tampered_tensor() -> None:
+    x = mx.array(
+        np.random.default_rng(4).normal(size=(4, 8)).astype(np.float32)
+    ).astype(mx.bfloat16)
+    tampered = np.full((4, 8), 5.0, dtype=np.float32)
+    hook = BoundaryHook(inject_fn=lambda a, r: tampered)
+    result = _apply_boundary_hook(x, hook, rank=1)
+    assert np.allclose(np.array(result.astype(mx.float32)), tampered)
+
+
+def test_apply_hook_fp16_injects_tampered_tensor() -> None:
+    x = mx.array(
+        np.random.default_rng(5).normal(size=(4, 8)).astype(np.float32)
+    ).astype(mx.float16)
+    tampered = np.full((4, 8), 5.0, dtype=np.float32)
+    hook = BoundaryHook(inject_fn=lambda a, r: tampered)
+    result = _apply_boundary_hook(x, hook, rank=1)
+    assert np.allclose(np.array(result.astype(mx.float32)), tampered)
