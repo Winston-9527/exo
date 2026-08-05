@@ -38,11 +38,14 @@ class MlxBuilder(Builder):
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
+    bound_instance: BoundInstance | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
+        self.bound_instance = bound_instance
         self.group = initialize_mlx(bound_instance)
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
+        self.bound_instance = bound_instance
         (
             self.inference_model,
             self.tokenizer,
@@ -62,6 +65,7 @@ class MlxBuilder(Builder):
     ) -> Engine:
         assert self.inference_model
         assert self.tokenizer
+        assert self.bound_instance
 
         vision_processor = self.vision_processor
 
@@ -95,6 +99,7 @@ class MlxBuilder(Builder):
                 device_rank=device_rank,
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
+                bound_instance=self.bound_instance,
                 vision_processor=vision_processor,
             )
         else:

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, WrapValidator
 
 from exo.shared.logging import logger
 from exo.shared.types.common import ModelId, TruncatingString
+from exo.shared.types.verifiable import VerifiableTaskMetadata
 
 MessageRole = Literal["user", "assistant", "system", "developer", "tool"]
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
@@ -115,7 +116,9 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     bench: bool = False
-    use_prefix_cache: bool = False
+    # ``None`` preserves the endpoint's normal cache policy.  ``False`` is an
+    # explicit per-request bypass used when a fresh-prefill control is needed.
+    use_prefix_cache: bool | None = None
     top_k: int | None = None
     stop: str | list[str] | None = None
     seed: int | None = None
@@ -133,6 +136,11 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     image_hashes: dict[int, Base64ImageHash] = Field(default_factory=dict)
 
     prefill_endpoint: str | None = None
+    verifiable: VerifiableTaskMetadata | None = None
+
+    def allows_prefix_cache(self) -> bool:
+        """Return whether this request permits shared prefix-cache reuse."""
+        return self.use_prefix_cache is not False
 
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models import model_cards

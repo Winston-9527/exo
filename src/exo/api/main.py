@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from hypercorn.asyncio import serve  # pyright: ignore[reportUnknownVariableType]
 from hypercorn.config import Config
 from hypercorn.typing import ASGIFramework
-from hypercorn.utils import LifespanTimeoutError
+from hypercorn.utils import LifespanTimeoutError, ShutdownError
 from loguru import logger
 
 from exo.api.adapters.chat_completions import (
@@ -50,6 +50,8 @@ from exo.api.keepalive import with_sse_keepalive
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
+    AwaitInstanceReadyMessage,
+    AwaitInstanceTimeoutMessage,
     BenchChatCompletionRequest,
     BenchChatCompletionResponse,
     BenchImageGenerationResponse,
@@ -97,6 +99,7 @@ from exo.api.types import (
     TraceRankStats,
     TraceResponse,
     TraceStatsResponse,
+    VerifiableChatCompletionRequest,
     normalize_image_size,
 )
 from exo.api.types.claude_api import (
@@ -196,14 +199,21 @@ from exo.shared.types.text_generation import (
     Base64ImageHash,
     TextGenerationTaskParams,
 )
+from exo.shared.types.verifiable import (
+    VerifiableAuditResponse,
+    VerifiableProviderIdentity,
+    VerifiableTaskMetadata,
+)
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 from exo.utils.banner import print_startup_banner
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.power_sampler import PowerSampler
 from exo.utils.task_group import TaskGroup
+from exo.verifiable.identity import local_delivery_identity
+from exo.verifiable.placement import placement_digest
 
 _API_EVENT_LOG_DIR = EXO_EVENT_LOG_DIR / "api"
 ONBOARDING_COMPLETE_FILE = EXO_CACHE_HOME / "onboarding_complete"
@@ -344,6 +354,7 @@ class API:
         self.app.post("/place_instance")(self.place_instance)
         self.app.get("/instance/placement")(self.get_placement)
         self.app.get("/instance/previews")(self.get_placement_previews)
+        self.app.get("/instance/await", response_model=None)(self.await_instance)
         self.app.get("/instance/{instance_id}")(self.get_instance)
         self.app.delete("/instance/{instance_id}")(self.delete_instance)
         self.app.get("/v1/instance-links")(self.list_instance_links)
@@ -359,6 +370,11 @@ class API:
         self.app.post("/v1/chat/completions", response_model=None)(
             self.chat_completions
         )
+        self.app.post("/v1/verifiable/chat/completions", response_model=None)(
+            self.verifiable_chat_completions
+        )
+        self.app.get("/v1/verifiable/identity")(self.get_verifiable_identity)
+        self.app.get("/v1/verifiable/audit/{request_id}")(self.get_verifiable_audit)
         self.app.post("/bench/chat/completions", response_model=None)(
             self.bench_chat_completions
         )
@@ -633,6 +649,48 @@ class API:
             raise HTTPException(status_code=404, detail="Instance not found")
         return self.state.instances[instance_id]
 
+    async def await_instance(
+        self,
+        model_id: ModelId,
+        timeout_seconds: float = Query(default=0.0, ge=0.0, le=300.0),
+    ) -> StreamingResponse:
+        _sleep = 0.1
+
+        async def _stream() -> AsyncGenerator[str, None]:
+            deadline = (
+                None if timeout_seconds == 0 else anyio.current_time() + timeout_seconds
+            )
+
+            while True:
+                for instance in self.state.instances.values():
+                    if instance.shard_assignments.model_id == model_id:
+                        payload = AwaitInstanceReadyMessage(instance=instance)
+                        yield f"data: {payload.model_dump_json()}\n\n"
+                        return
+
+                if deadline is None:
+                    await anyio.sleep(_sleep)
+                else:
+                    remaining = deadline - anyio.current_time()
+                    if remaining <= 0:
+                        payload = AwaitInstanceTimeoutMessage(
+                            message=f"No instance found for model {model_id}"
+                        )
+                        yield f"data: {payload.model_dump_json()}\n\n"
+                        return
+
+                    await anyio.sleep(min(_sleep, remaining))
+
+        return StreamingResponse(
+            with_sse_keepalive(_stream()),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     async def delete_instance(self, instance_id: InstanceId) -> DeleteInstanceResponse:
         if instance_id not in self.state.instances:
             raise HTTPException(status_code=404, detail="Instance not found")
@@ -761,6 +819,8 @@ class API:
                 if isinstance(chunk, PrefillProgressChunk):
                     continue
 
+                sampler.mark_prefill_done()
+
                 if chunk.finish_reason == "error":
                     raise HTTPException(
                         status_code=500,
@@ -871,10 +931,8 @@ class API:
     ) -> ChatCompletionResponse | StreamingResponse:
         """OpenAI Chat Completions API - adapter."""
         task_params = await chat_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
-            ModelId(task_params.model)
-        )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        validated_model = await self._validate_model_has_instance(task_params.model)
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -902,20 +960,195 @@ class API:
                 media_type="application/json",
             )
 
+    async def verifiable_chat_completions(
+        self, payload: VerifiableChatCompletionRequest
+    ) -> StreamingResponse:
+        """Accept an encrypted request only when its recipient is the first shard."""
+        instance = self.state.instances.get(InstanceId(payload.instance_id))
+        if instance is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND,
+                detail=f"Instance {payload.instance_id} was not found",
+            )
+
+        first_shard_nodes: list[NodeId] = []
+        for node_id, runner_id in instance.shard_assignments.node_to_runner.items():
+            shard = instance.shard_assignments.runner_to_shard[runner_id]
+            if not isinstance(shard, PipelineShardMetadata):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="Verifiable requests require a pure pipeline placement",
+                )
+            if shard.is_first_layer:
+                first_shard_nodes.append(node_id)
+
+        if len(first_shard_nodes) != 1:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Verifiable requests require exactly one first pipeline shard",
+            )
+
+        if self.node_id != first_shard_nodes[0]:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "Verifiable requests must be submitted to the placement "
+                    "ingress node API"
+                ),
+            )
+
+        if payload.recipient.node_id != first_shard_nodes[0]:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Encrypted recipient is not the first pipeline shard",
+            )
+
+        local_identity = local_delivery_identity(self.node_id)
+        if (
+            payload.recipient.provider_id != local_identity.provider_id
+            or payload.recipient.key_id != local_identity.key_id
+        ):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "Encrypted recipient does not match the ingress node's "
+                    "local delivery identity"
+                ),
+            )
+
+        if payload.placement_digest != placement_digest(instance, payload.recipient):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Encrypted request placement digest does not match the instance",
+            )
+
+        task_params = TextGenerationTaskParams(
+            model=payload.model,
+            input=[],
+            max_output_tokens=payload.generation.max_output_tokens,
+            temperature=payload.generation.temperature,
+            seed=payload.generation.seed,
+            stream=payload.generation.stream,
+            logprobs=payload.generation.logprobs,
+            top_logprobs=payload.generation.top_logprobs,
+            use_prefix_cache=False,
+            verifiable=VerifiableTaskMetadata(
+                protocol_version=payload.protocol_version,
+                request_id=payload.request_id,
+                placement_digest=payload.placement_digest,
+                recipient=payload.recipient,
+                encrypted_input=payload.encrypted_input,
+            ),
+        )
+        task_params = task_params.with_card_sampling_defaults()
+        # History-dependent processors would see dummy prompt IDs downstream and
+        # could make ranks sample different tokens or terminate at different times.
+        task_params = task_params.model_copy(
+            update={
+                "repetition_penalty": None,
+                "presence_penalty": None,
+                "frequency_penalty": None,
+            }
+        )
+        command = TextGeneration(
+            task_params=task_params,
+            instance_id=InstanceId(payload.instance_id),
+        )
+        await self._send(command)
+
+        if payload.generation.stream:
+            return StreamingResponse(
+                with_sse_keepalive(
+                    generate_chat_stream(
+                        command.command_id,
+                        self._token_chunk_stream(command.command_id),
+                    ),
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "close",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        return StreamingResponse(
+            collect_chat_response(
+                command.command_id,
+                self._token_chunk_stream(command.command_id),
+            ),
+            media_type="application/json",
+        )
+
+    def get_verifiable_identity(self) -> VerifiableProviderIdentity:
+        """Return this node's public delivery identity for requester encryption."""
+        return local_delivery_identity(self.node_id)
+
+    def get_verifiable_audit(self, request_id: str) -> VerifiableAuditResponse:
+        receipts = list(self.state.verifiable_receipts.get(request_id, ()))
+        if not receipts:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND,
+                detail=f"No verifiable audit receipts found for {request_id}",
+            )
+        execution_ids = {receipt.execution_id for receipt in receipts}
+        if len(execution_ids) != 1:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=(
+                    f"Audit request {request_id} contains receipts from "
+                    "multiple executions"
+                ),
+            )
+        execution_id = next(iter(execution_ids))
+        common_fields = (
+            "request_id",
+            "instance_id",
+            "placement_digest",
+            "ciphertext_digest",
+            "world_size",
+            "recipient_provider_id",
+            "recipient_key_id",
+            "prompt_token_count",
+        )
+        for field in common_fields:
+            values = {getattr(receipt, field) for receipt in receipts}
+            if len(values) != 1:
+                raise HTTPException(
+                    status_code=HTTPStatus.CONFLICT,
+                    detail=(
+                        f"Audit request {request_id} contains conflicting "
+                        f"{field} values for execution {execution_id}"
+                    ),
+                )
+        if receipts[0].request_id != request_id:
+            raise HTTPException(
+                status_code=HTTPStatus.CONFLICT,
+                detail=(
+                    f"Audit request {request_id} does not match receipt request_id "
+                    f"for execution {execution_id}"
+                ),
+            )
+        return VerifiableAuditResponse(
+            request_id=request_id,
+            execution_id=execution_id,
+            expected_ranks=receipts[0].world_size,
+            receipts=receipts,
+        )
+
     async def bench_chat_completions(
         self, payload: BenchChatCompletionRequest
     ) -> BenchChatCompletionResponse | StreamingResponse:
         task_params = await chat_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         task_params = task_params.model_copy(
             update={
                 "stream": False,
                 "bench": True,
-                "use_prefix_cache": payload.use_prefix_cache,
+                "use_prefix_cache": payload.use_prefix_cache is True,
             }
         )
 
@@ -939,8 +1172,10 @@ class API:
 
         return await self._collect_text_generation_with_stats(command.command_id)
 
-    async def _resolve_and_validate_text_model(self, model_id: ModelId) -> ModelId:
-        """Validate a text model exists and return the resolved model ID.
+    async def _validate_model_has_instance(self, model_id: ModelId) -> ModelId:
+        """Validate a model has an active instance.
+        If the model isn't even downloaded, triggers notification to user to download model.
+
 
         Raises HTTPException 404 if no instance is found for the model.
         """
@@ -948,29 +1183,20 @@ class API:
             instance.shard_assignments.model_id == model_id
             for instance in self.state.instances.values()
         ):
-            await self._trigger_notify_user_to_download_model(model_id)
+            # Check if model is actually downloaded
+            model_is_downloaded = any(
+                isinstance(download, DownloadCompleted)
+                and download.shard_metadata.model_card.model_id == model_id
+                for node_downloads in self.state.downloads.values()
+                for download in node_downloads
+            )
+            if not model_is_downloaded:
+                await self._trigger_notify_user_to_download_model(model_id)
+
             raise HTTPException(
-                status_code=404,
-                detail=f"No instance found for model {model_id}",
+                status_code=404, detail=f"No instance found for model {model_id}"
             )
         return model_id
-
-    async def _validate_image_model(self, model: ModelId) -> ModelId:
-        """Validate model exists and return resolved model ID.
-
-        Raises HTTPException 404 if no instance is found for the model.
-        """
-        model_card = await ModelCard.load(model)
-        resolved_model = model_card.model_id
-        if not any(
-            instance.shard_assignments.model_id == resolved_model
-            for instance in self.state.instances.values()
-        ):
-            await self._trigger_notify_user_to_download_model(resolved_model)
-            raise HTTPException(
-                status_code=404, detail=f"No instance found for model {resolved_model}"
-            )
-        return resolved_model
 
     def stream_events(self) -> StreamingResponse:
         def _generate_json_array(events: Iterable[Event]) -> Iterable[str]:
@@ -1024,7 +1250,9 @@ class API:
         """
         payload = payload.model_copy(
             update={
-                "model": await self._validate_image_model(ModelId(payload.model)),
+                "model": await self._validate_model_has_instance(
+                    ModelId(payload.model)
+                ),
                 "advanced_params": _ensure_seed(payload.advanced_params),
             }
         )
@@ -1292,7 +1520,9 @@ class API:
     ) -> BenchImageGenerationResponse:
         payload = payload.model_copy(
             update={
-                "model": await self._validate_image_model(ModelId(payload.model)),
+                "model": await self._validate_model_has_instance(
+                    ModelId(payload.model)
+                ),
                 "stream": False,
                 "partial_images": 0,
                 "advanced_params": _ensure_seed(payload.advanced_params),
@@ -1328,7 +1558,7 @@ class API:
         advanced_params: AdvancedImageParams | None,
     ) -> ImageEdits:
         """Prepare and send an image edits command with chunked image upload."""
-        resolved_model = await self._validate_image_model(model)
+        validated_model = await self._validate_model_has_instance(model)
         advanced_params = _ensure_seed(advanced_params)
 
         image_content = await image.read()
@@ -1347,7 +1577,7 @@ class API:
                 image_data="",
                 total_input_chunks=total_chunks,
                 prompt=prompt,
-                model=resolved_model,
+                model=validated_model,
                 n=n,
                 size=size,
                 response_format=response_format,
@@ -1368,7 +1598,7 @@ class API:
             await self._send(
                 SendInputChunk(
                     chunk=InputImageChunk(
-                        model=resolved_model,
+                        model=validated_model,
                         command_id=command.command_id,
                         data=chunk_data,
                         chunk_index=chunk_index,
@@ -1492,10 +1722,10 @@ class API:
     ) -> ClaudeMessagesResponse | StreamingResponse:
         """Claude Messages API - adapter."""
         task_params = await claude_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1530,8 +1760,8 @@ class API:
     ) -> ResponsesResponse | StreamingResponse:
         """OpenAI Responses API."""
         task_params = await responses_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(task_params.model)
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        validated_model = await self._validate_model_has_instance(task_params.model)
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1573,10 +1803,10 @@ class API:
         body = await request.body()
         payload = OllamaChatRequest.model_validate_json(body)
         task_params = ollama_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1609,10 +1839,10 @@ class API:
         body = await request.body()
         payload = OllamaGenerateRequest.model_validate_json(body)
         task_params = ollama_generate_request_to_text_generation(payload)
-        resolved_model = await self._resolve_and_validate_text_model(
+        validated_model = await self._validate_model_has_instance(
             ModelId(task_params.model)
         )
-        task_params = task_params.model_copy(update={"model": resolved_model})
+        task_params = task_params.model_copy(update={"model": validated_model})
 
         command = await self._send_text_generation_with_images(task_params)
 
@@ -1914,6 +2144,10 @@ class API:
                     cfg,
                     shutdown_trigger=ev.wait,
                 )
+                if not ev.is_set():
+                    raise ShutdownError(
+                        "Server exited without shutdown trigger - exiting abnormally"
+                    )
             except LifespanTimeoutError as e:
                 logger.warning(
                     "Graceful server shutdown timed out, some connections forcebly closed"

@@ -186,6 +186,12 @@ class NodePowerStats(BaseModel, frozen=True):
     node_id: NodeId
     samples: int
     avg_sys_power: float
+    # Per-phase breakdown. Populated only when the caller marks a phase
+    # boundary (e.g. prefill -> generation); None otherwise.
+    prefill_avg_sys_power: float | None = None
+    generation_avg_sys_power: float | None = None
+    prefill_energy_joules: float | None = None
+    generation_energy_joules: float | None = None
 
 
 class PowerUsage(BaseModel, frozen=True):
@@ -193,6 +199,16 @@ class PowerUsage(BaseModel, frozen=True):
     nodes: list[NodePowerStats]
     total_avg_sys_power_watts: float
     total_energy_joules: float
+    # Split between the prefill (prompt-processing) phase and the
+    # generation/decode phase. Populated only when the caller marks a phase
+    # boundary; None otherwise. The two phase energies should sum to
+    # approximately `total_energy_joules` (modulo interpolation rounding).
+    prefill_seconds: float | None = None
+    generation_seconds: float | None = None
+    prefill_energy_joules: float | None = None
+    generation_energy_joules: float | None = None
+    prefill_avg_sys_power_watts: float | None = None
+    generation_avg_sys_power_watts: float | None = None
 
 
 class BenchChatCompletionResponse(ChatCompletionResponse):
@@ -231,10 +247,13 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # EXO extension: omit to preserve normal caching, or set false to require
+    # a fresh prefill for this request.
+    use_prefix_cache: bool | None = None
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):
-    use_prefix_cache: bool = False
+    use_prefix_cache: bool | None = False
 
 
 class AddCustomModelParams(BaseModel):
@@ -289,6 +308,16 @@ class DeleteInstanceResponse(BaseModel):
     message: str
     command_id: CommandId
     instance_id: InstanceId
+
+
+class AwaitInstanceReadyMessage(BaseModel):
+    type: Literal["ready"] = "ready"
+    instance: Instance
+
+
+class AwaitInstanceTimeoutMessage(BaseModel):
+    type: Literal["timeout"] = "timeout"
+    message: str
 
 
 class CancelCommandResponse(BaseModel):

@@ -1,107 +1,120 @@
-use futures_lite::StreamExt;
-use networking::swarm::{FromSwarm, create_swarm};
+use std::net::{TcpListener, UdpSocket};
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
 
-/// Helper: find a free TCP port.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+use networking::swarm::create_swarm;
+use tokio::sync::mpsc;
+
+#[tokio::test]
+async fn create_swarm_rejects_invalid_bootstrap_endpoint() {
+    let (_sender, receiver) = mpsc::channel(1);
+
+    let result = create_swarm(
+        "1",
+        "static-bootstrap-test",
+        receiver,
+        52414,
+        52413,
+        vec!["not-a-zenoh-endpoint".to_owned()],
+    )
+    .await;
+
+    assert!(result.is_err());
 }
 
-/// Two nodes connect via bootstrap peers — no mDNS needed.
-///
-/// Node A listens on a fixed port. Node B bootstraps to A's address.
-/// We verify that B emits `FromSwarm::Discovered` for A's peer ID.
-#[tokio::test]
-async fn two_nodes_connect_via_bootstrap_peers() {
-    let port_a = free_port();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_swarms_connect_without_multicast_discovery() {
+    let (first_listen_port, second_listen_port) = unused_tcp_ports();
+    let (first_discovery_port, second_discovery_port) = unused_udp_ports();
 
-    // Node A: listens on a known port, no bootstrap peers
-    let keypair_a = libp2p::identity::Keypair::generate_ed25519();
-    let peer_id_a = keypair_a.public().to_peer_id();
-    let (_tx_a, rx_a) = mpsc::channel(16);
-    let swarm_a = create_swarm(keypair_a, rx_a, vec![], port_a).expect("create swarm A");
-    let mut stream_a = swarm_a.into_stream();
-
-    // Node B: bootstraps to A's address
-    let keypair_b = libp2p::identity::Keypair::generate_ed25519();
-    let (_tx_b, rx_b) = mpsc::channel(16);
-    let swarm_b = create_swarm(
-        keypair_b,
-        rx_b,
-        vec![format!("/ip4/127.0.0.1/tcp/{port_a}")],
-        0,
+    let (_first_sender, first_receiver) = mpsc::channel(1);
+    let first_swarm = create_swarm(
+        "1",
+        "static-bootstrap-test",
+        first_receiver,
+        first_listen_port,
+        first_discovery_port,
+        vec![],
     )
-    .expect("create swarm B");
-    let mut stream_b = swarm_b.into_stream();
+    .await
+    .expect("the listening swarm should start");
 
-    // Wait for B to discover A (connection established)
-    let connected = timeout(Duration::from_secs(10), async {
+    let (_second_sender, second_receiver) = mpsc::channel(1);
+    let second_swarm = create_swarm(
+        "2",
+        "static-bootstrap-test",
+        second_receiver,
+        second_listen_port,
+        second_discovery_port,
+        vec![format!("tcp/[::1]:{first_listen_port}")],
+    )
+    .await
+    .expect("the dialing swarm should start");
+
+    let subscriber = first_swarm
+        .session
+        .z
+        .declare_subscriber("tests/static-bootstrap")
+        .await
+        .expect("the listening swarm should subscribe");
+    let publisher = second_swarm
+        .session
+        .z
+        .declare_publisher("tests/static-bootstrap")
+        .await
+        .expect("the dialing swarm should publish");
+    let receive_payload = async {
         loop {
             tokio::select! {
-                Some(event) = stream_a.next() => {
-                    // A will also see B connect, but we check from B's perspective
-                    let _ = event;
+                sample = subscriber.recv_async() => {
+                    let sample = sample.expect("the subscriber should remain open");
+                    break sample.payload().to_bytes().to_vec();
                 }
-                Some(event) = stream_b.next() => {
-                    if let FromSwarm::Discovered { peer_id } = event {
-                        if peer_id == peer_id_a {
-                            return true;
-                        }
-                    }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    publisher
+                        .put("connected")
+                        .await
+                        .expect("publishing the test payload should succeed");
                 }
             }
         }
-    })
-    .await;
+    };
 
-    assert!(
-        connected.is_ok() && connected.unwrap(),
-        "Node B should discover Node A via bootstrap peer"
-    );
+    let payload = tokio::time::timeout(Duration::from_secs(5), receive_payload)
+        .await
+        .expect("static peers should exchange data without multicast");
+    assert_eq!(payload.as_slice(), b"connected");
 }
 
-/// Empty bootstrap peers should work (backward compatible).
-#[tokio::test]
-async fn create_swarm_with_empty_bootstrap_peers() {
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let (_tx, rx) = mpsc::channel(16);
-    let swarm = create_swarm(keypair, rx, vec![], 0);
-    assert!(
-        swarm.is_ok(),
-        "create_swarm with no bootstrap peers should succeed"
-    );
+fn unused_tcp_ports() -> (u16, u16) {
+    let first =
+        TcpListener::bind("[::1]:0").expect("a first IPv6 loopback TCP port should be available");
+    let second =
+        TcpListener::bind("[::1]:0").expect("a second IPv6 loopback TCP port should be available");
+    (
+        first
+            .local_addr()
+            .expect("the first TCP listener should have a local address")
+            .port(),
+        second
+            .local_addr()
+            .expect("the second TCP listener should have a local address")
+            .port(),
+    )
 }
 
-/// Invalid multiaddr strings are silently filtered out.
-#[tokio::test]
-async fn create_swarm_ignores_invalid_bootstrap_addrs() {
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let (_tx, rx) = mpsc::channel(16);
-    let swarm = create_swarm(
-        keypair,
-        rx,
-        vec![
-            "not-a-valid-multiaddr".to_string(),
-            "".to_string(),
-            "/ip4/10.0.0.1/tcp/30000".to_string(), // valid
-        ],
-        0,
-    );
-    assert!(
-        swarm.is_ok(),
-        "create_swarm should succeed even with invalid bootstrap addrs"
-    );
-}
-
-/// Fixed listen port works correctly.
-#[tokio::test]
-async fn create_swarm_with_fixed_port() {
-    let port = free_port();
-    let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let (_tx, rx) = mpsc::channel(16);
-    let swarm = create_swarm(keypair, rx, vec![], port);
-    assert!(swarm.is_ok(), "create_swarm with fixed port should succeed");
+fn unused_udp_ports() -> (u16, u16) {
+    let first =
+        UdpSocket::bind("[::1]:0").expect("a first IPv6 loopback UDP port should be available");
+    let second =
+        UdpSocket::bind("[::1]:0").expect("a second IPv6 loopback UDP port should be available");
+    (
+        first
+            .local_addr()
+            .expect("the first UDP socket should have a local address")
+            .port(),
+        second
+            .local_addr()
+            .expect("the second UDP socket should have a local address")
+            .port(),
+    )
 }

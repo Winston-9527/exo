@@ -1,7 +1,7 @@
 import itertools
 import time
 from collections import deque
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
@@ -11,7 +11,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from exo.shared.constants import EXO_MAX_CONCURRENT_REQUESTS
 from exo.shared.types.chunks import ErrorChunk, GenerationChunk, PrefillProgressChunk
 from exo.shared.types.common import ModelId
-from exo.shared.types.events import ChunkGenerated, Event
+from exo.shared.types.events import ChunkGenerated, Event, VerifiableInputPrepared
 from exo.shared.types.tasks import (
     CANCEL_ALL_TASKS,
     GenerationTask,
@@ -19,12 +19,19 @@ from exo.shared.types.tasks import (
     TextGeneration,
 )
 from exo.shared.types.text_generation import TextGenerationTaskParams
+from exo.shared.types.worker.instances import BoundInstance
 from exo.shared.types.worker.runner_response import (
     CancelledResponse,
     FinishedResponse,
     GenerationResponse,
 )
 from exo.utils.channels import MpReceiver, MpSender
+from exo.verifiable.identity import load_delivery_private_key
+from exo.verifiable.runtime import (
+    VerifiableInputSource,
+    build_verifiable_input_receipt,
+    prepare_rank_generation_input,
+)
 from exo.worker.disaggregated.server import PrefillRequest
 from exo.worker.engines.base import Engine
 from exo.worker.engines.mlx.cache import KVPrefixCache
@@ -33,9 +40,15 @@ from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
+    gather_distributed_integers,
     mlx_generate,
     warmup_inference,
 )
+from exo.worker.engines.mlx.generator.verifiable_sync import (
+    should_run_debug_prompt_check,
+    synchronize_rank_preparation,
+)
+from exo.worker.engines.mlx.tracing import emit_traces_collected
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -97,6 +110,8 @@ class SequentialGenerator(Engine):
     device_rank: int
     cancel_receiver: MpReceiver[TaskId]
     event_sender: MpSender[Event]
+    bound_instance: BoundInstance
+    delivery_private_key_loader: Callable[[], str] = load_delivery_private_key
     vision_processor: VisionProcessor | None = None
     check_for_cancel_every: int = 50
 
@@ -190,6 +205,7 @@ class SequentialGenerator(Engine):
 
         except (StopIteration, PrefillCancelled):
             output.append((task.task_id, FinishedResponse()))
+            emit_traces_collected(self.event_sender, task.task_id, self.device_rank)
             self._active = None
             if self._queue:
                 self._start_next()
@@ -212,7 +228,7 @@ class SequentialGenerator(Engine):
     def _start_next(self) -> None:
         task = self._queue.popleft()
         try:
-            gen = self._build_generator(task)
+            gen, parser_prompt, effective_task_params = self._build_generator(task)
         except Exception as e:
             self._send_error(task, e)
             raise
@@ -225,12 +241,12 @@ class SequentialGenerator(Engine):
         else:
             output_generator = apply_all_parsers(
                 queue.gen(),
-                apply_chat_template(self.tokenizer, task.task_params),
+                parser_prompt,
                 self.tool_parser,
                 self.tokenizer,
                 type(self.model),
                 self.model_id,
-                task.task_params.tools,
+                effective_task_params.tools,
             )
         self._active = (task, gen, queue, output_generator)
 
@@ -247,9 +263,32 @@ class SequentialGenerator(Engine):
                 )
             )
 
-    def _build_generator(self, task: TextGeneration) -> Generator[GenerationResponse]:
-        _check_for_debug_prompts(task.task_params)
-        prompt = apply_chat_template(self.tokenizer, task.task_params)
+    def _build_generator(
+        self, task: TextGeneration
+    ) -> tuple[Generator[GenerationResponse], str, TextGenerationTaskParams]:
+        private_prompt_source_rank: int | None = None
+        verifiable_input_source: VerifiableInputSource | None = None
+        effective_task_params = task.task_params
+        is_verifiable = task.task_params.verifiable is not None
+        if not is_verifiable:
+            prompt = apply_chat_template(self.tokenizer, task.task_params)
+        else:
+            prepared = synchronize_rank_preparation(
+                lambda: prepare_rank_generation_input(
+                    task.task_params,
+                    self.bound_instance,
+                    self.delivery_private_key_loader,
+                    lambda params: apply_chat_template(self.tokenizer, params),
+                ),
+                lambda ready: gather_distributed_integers(ready, self.group),
+            )
+            effective_task_params = prepared.task_params
+            prompt = prepared.prompt
+            private_prompt_source_rank = prepared.private_prompt_source_rank
+            verifiable_input_source = prepared.source
+
+        if should_run_debug_prompt_check(is_verifiable=is_verifiable):
+            _check_for_debug_prompts(effective_task_params)
 
         def on_prefill_progress(processed: int, total: int) -> None:
             if self.device_rank == 0:
@@ -284,18 +323,49 @@ class SequentialGenerator(Engine):
 
                 self.agree_on_tasks()
 
-        return mlx_generate(
+        def on_private_prompt_prepared(prompt_token_count: int) -> None:
+            assert verifiable_input_source is not None
+            self.event_sender.send(
+                VerifiableInputPrepared(
+                    receipt=build_verifiable_input_receipt(
+                        task.task_params,
+                        self.bound_instance,
+                        verifiable_input_source,
+                        execution_id=task.command_id,
+                        delivery_private_key_loader=self.delivery_private_key_loader,
+                        prompt_token_count=prompt_token_count,
+                    )
+                )
+            )
+
+        generator = mlx_generate(
             model=self.model,
             tokenizer=self.tokenizer,
-            task=task.task_params,
+            task=effective_task_params,
             prompt=prompt,
-            kv_prefix_cache=self.kv_prefix_cache,
+            kv_prefix_cache=(
+                None
+                if task.task_params.verifiable is not None
+                or not effective_task_params.allows_prefix_cache()
+                else self.kv_prefix_cache
+            ),
             on_prefill_progress=on_prefill_progress,
             distributed_prompt_progress_callback=distributed_prompt_progress_callback,
             on_generation_token=on_generation_token,
             group=self.group,
-            vision_processor=self.vision_processor,
+            vision_processor=(
+                None
+                if task.task_params.verifiable is not None
+                else self.vision_processor
+            ),
+            private_prompt_source_rank=private_prompt_source_rank,
+            on_private_prompt_prepared=(
+                on_private_prompt_prepared
+                if task.task_params.verifiable is not None
+                else None
+            ),
         )
+        return generator, prompt, effective_task_params
 
     def close(self) -> None:
         del self.model, self.tokenizer, self.group
@@ -368,6 +438,11 @@ class BatchGenerator(Engine):
         task: GenerationTask,
     ) -> None:
         assert isinstance(task, TextGeneration)
+        if task.task_params.verifiable is not None:
+            raise ValueError(
+                "Verifiable encrypted requests currently require batching to be "
+                "disabled with --no-batch"
+            )
         self._cancelled_tasks.discard(CANCEL_ALL_TASKS)
         self._all_tasks[task.task_id] = task
         self._maybe_queue.append(task)
@@ -456,6 +531,7 @@ class BatchGenerator(Engine):
             # check if original response was terminal and append a Finished()
             if response.finish_reason is not None:
                 output.append((task.task_id, FinishedResponse()))
+                emit_traces_collected(self.event_sender, task.task_id, self.device_rank)
                 del self._active_tasks[uid]
 
         return filter(

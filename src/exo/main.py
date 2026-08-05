@@ -8,23 +8,26 @@ from dataclasses import dataclass, field
 from typing import Self
 
 import anyio
+from anyio.lowlevel import checkpoint as anyio_checkpoint
+from daemon import DaemonContext  # pyright: ignore[reportMissingTypeStubs]
+from exo_rs import Pidfile, PidfileError
 from loguru import logger
 from pydantic import PositiveInt
 
 import exo.routing.topics as topics
+from exo import __version__
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
-from exo.routing.router import Router, get_node_id_keypair
-from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG
+from exo.routing.router import Router, get_node_zid
+from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_LOG, EXO_PID_FILE
 from exo.shared.election import Election, ElectionResult
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.types.common import NodeId, SessionId
+from exo.utils import STDIO_FDS
 from exo.utils.channels import Receiver, channel
-from exo.utils.daemon import detach_stdio_to_devnull
-from exo.utils.pidfile import PidfileLockError, acquire_exo_pidfile
 from exo.utils.pydantic_ext import FrozenModel
 from exo.utils.task_group import TaskGroup
 from exo.worker.main import Worker
@@ -48,13 +51,14 @@ class Node:
 
     @classmethod
     async def create(cls, args: "Args") -> Self:
-        keypair = get_node_id_keypair()
-        node_id = NodeId(keypair.to_node_id())
+        node_id = get_node_zid()
         session_id = SessionId(master_node_id=node_id, election_clock=0)
         router = Router.create(
-            keypair,
+            node_id,
+            namespace=args.namespace,
+            listen_port=args.zenoh_port,
+            discovery_service_port=args.discovery_port,
             bootstrap_peers=args.bootstrap_peers,
-            listen_port=args.libp2p_port,
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -190,7 +194,7 @@ class Node:
                 # - Shut down and re-create the API
 
                 if result.is_new_master:
-                    await anyio.sleep(0)
+                    await anyio_checkpoint()
                     self.event_router.shutdown()
                     self.event_router = EventRouter(
                         result.session_id,
@@ -203,7 +207,10 @@ class Node:
                     result.session_id.master_node_id == self.node_id
                     and self.master is not None
                 ):
-                    logger.info("Node elected Master")
+                    assert not result.is_new_master, (
+                        "cannot be new master if we remain master"
+                    )
+                    logger.info("Node elected Master - maintaining self")
                 elif (
                     result.session_id.master_node_id == self.node_id
                     and self.master is None
@@ -270,14 +277,60 @@ class Node:
 
 
 def main():
-    # Exit early if no PID file (not compatible with double-for daemonization yet)
-    try:
-        pidfile = acquire_exo_pidfile()
-    except PidfileLockError as exception:
-        print(exception, file=sys.stderr)
-        raise SystemExit(1) from exception
-
+    # Parse args first => --help or bad args don't require PID-locking
     args = Args.parse()
+
+    # Exit early if cannot acquire PID file
+    try:
+        pidfile = Pidfile(EXO_PID_FILE, 0o0600)
+    except PidfileError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(1) from e
+
+    try:
+        if args.legacy_daemon:
+            # keep stdio backed by explicit /dev/null streams. multiprocessing spawn expects
+            # valid stdio FDs; letting DaemonContext close/reopen them can break runner startup.
+            for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+                if stream is not None:
+                    stream.flush()
+            stdin = open(os.devnull, "r")  # noqa: SIM115
+            stdout = open(os.devnull, "w")  # noqa: SIM115
+            stderr = open(os.devnull, "w")  # noqa: SIM115
+
+            with DaemonContext(
+                detach_process=True,
+                files_preserve=[pidfile.as_raw_fd()],
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                # cleanup loose file descriptors (as long as they aren't stdio)
+                for f in (
+                    f for f in (stdin, stdout, stderr) if f.fileno() not in STDIO_FDS
+                ):
+                    f.close()
+
+                # 1) if daemonizing => fork then write PID
+                try:
+                    pidfile.write()
+                except PidfileError as e:
+                    print(e, file=sys.stderr)
+                    raise SystemExit(1) from e
+                main_inner(args)
+        else:
+            # 2) otherwise      => just write PID
+            try:
+                pidfile.write()
+            except PidfileError as e:
+                print(e, file=sys.stderr)
+                raise SystemExit(1) from e
+            main_inner(args)
+    finally:
+        pidfile.close()
+
+
+def main_inner(args: "Args"):
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(max(soft, 65535), hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
@@ -286,20 +339,16 @@ def main():
 
     # TODO: Refactor the current verbosity system
     logger_setup(EXO_LOG, args.verbosity)
-    if args.no_stdio:
-        detach_stdio_to_devnull()
-        logger.info("Detached stdio to /dev/null")
 
-    logger.info(f"{'=' * 40}")
-    logger.info(f"Starting EXO | pid={os.getpid()}")
-    logger.info(f"{'=' * 40}")
-    logger.info(f"EXO_LIBP2P_NAMESPACE: {os.getenv('EXO_LIBP2P_NAMESPACE')}")
+    logger.info(f"pid = {os.getpid()}")
+    if os.getenv("EXO_LIBP2P_NAMESPACE"):
+        raise ValueError(
+            "EXO_LIBP2P_NAMESPACE has been removed - use EXO_ZENOH_NAMESPACE instead"
+        )
+    logger.info(f"EXO_ZENOH_NAMESPACE: {os.getenv('EXO_ZENOH_NAMESPACE')}")
 
     if args.offline:
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
-
-    if args.bootstrap_peers:
-        logger.info(f"Bootstrap peers: {args.bootstrap_peers}")
 
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
@@ -324,7 +373,6 @@ def main():
     finally:
         logger.info("EXO Shutdown complete")
         logger_cleanup()
-        del pidfile
 
 
 class Args(FrozenModel):
@@ -338,9 +386,11 @@ class Args(FrozenModel):
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
     no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
-    no_stdio: bool = False
+    legacy_daemon: bool = False
     bootstrap_peers: list[str] = []
-    libp2p_port: int
+    namespace: str
+    zenoh_port: int
+    discovery_port: int
 
     @classmethod
     def parse(cls) -> Self:
@@ -399,9 +449,9 @@ class Args(FrozenModel):
             help="Disable continuous batching, use sequential generation",
         )
         parser.add_argument(
-            "--no-stdio",
+            "--legacy-daemon",
             action="store_true",
-            help="Detach stdin/stdout/stderr to /dev/null after logging is configured",
+            help="Run as a legacy SysV-style background daemon using double-fork daemonization",
         )
         parser.add_argument(
             "--bootstrap-peers",
@@ -410,14 +460,35 @@ class Args(FrozenModel):
             if os.getenv("EXO_BOOTSTRAP_PEERS")
             else [],
             dest="bootstrap_peers",
-            help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
+            help=(
+                "Comma-separated Zenoh TCP endpoints to connect to on startup, for "
+                "example tcp/100.64.0.2:52414. Static connections bypass "
+                "namespace-based discovery filtering (env: EXO_BOOTSTRAP_PEERS)."
+            ),
         )
         parser.add_argument(
-            "--libp2p-port",
+            "--namespace",
+            type=str,
+            default=__version__,
+            dest="namespace",
+            help=(
+                "Multicast discovery namespace. Static connections do not enforce "
+                "namespace matching."
+            ),
+        )
+        parser.add_argument(
+            "--zenoh-port",
             type=int,
-            default=0,
-            dest="libp2p_port",
-            help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+            default=52414,
+            dest="zenoh_port",
+            help="Fixed TCP port for zenoh to listen.",
+        )
+        parser.add_argument(
+            "--discovery-port",
+            type=int,
+            default=52413,
+            dest="discovery_port",
+            help="Fixed UDP port for the discovery service.",
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(

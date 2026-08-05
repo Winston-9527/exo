@@ -11,6 +11,10 @@ from exo.master.placement import (
     place_instance,
 )
 from exo.master.placement_utils import find_ip_prioritised
+from exo.routing.event_router import (
+    EventRouterBrokenResourceError,
+    EventRouterClosedResourceError,
+)
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
 from exo.shared.types.commands import (
@@ -68,6 +72,7 @@ from exo.shared.types.tasks import (
 from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
+from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import InstanceId
 from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
@@ -115,6 +120,61 @@ def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str |
     return None
 
 
+def _prefill_endpoint_for_task(
+    state: State,
+    decode_instance_id: InstanceId,
+    task_params: TextGenerationTaskParams,
+) -> str | None:
+    """Resolve remote prefill only when this task permits shared cache reuse."""
+    if task_params.verifiable is not None or not task_params.allows_prefix_cache():
+        return None
+    return _prefill_endpoint_for(state, decode_instance_id)
+
+
+def _select_text_generation_instance_id(
+    state: State, command: TextGeneration
+) -> InstanceId:
+    """Select a decode instance, preserving an explicit placement binding."""
+    if command.instance_id is not None:
+        instance = state.instances.get(command.instance_id)
+        if instance is None:
+            raise ValueError(f"No requested instance found: {command.instance_id}")
+        if instance.shard_assignments.model_id != command.task_params.model:
+            raise ValueError(
+                "Requested instance model does not match text-generation model"
+            )
+        return command.instance_id
+
+    # set-difference => prefill-only nodes
+    prefill_only: set[InstanceId] = set()
+    for link in state.instance_links.values():
+        prefill_only.update(link.prefill_instances)
+    for link in state.instance_links.values():
+        prefill_only.difference_update(link.decode_instances)
+
+    in_flight = {TaskStatus.Pending, TaskStatus.Running}
+    instance_task_counts: dict[InstanceId, int] = {}
+    for instance in state.instances.values():
+        if (
+            instance.shard_assignments.model_id == command.task_params.model
+            and instance.instance_id not in prefill_only
+        ):
+            instance_task_counts[instance.instance_id] = sum(
+                1
+                for task in state.tasks.values()
+                if task.instance_id == instance.instance_id
+                and task.task_status in in_flight
+            )
+
+    if not instance_task_counts:
+        raise ValueError(f"No instance found for model {command.task_params.model}")
+
+    return min(
+        instance_task_counts,
+        key=lambda instance_id: instance_task_counts[instance_id],
+    )
+
+
 class Master:
     def __init__(
         self,
@@ -151,6 +211,9 @@ class Master:
                 tg.start_soon(self._event_processor)
                 tg.start_soon(self._command_processor)
                 tg.start_soon(self._plan)
+        except* (EventRouterBrokenResourceError, EventRouterClosedResourceError):
+            # Event router has been closed (try-star syntax handles error groups)
+            pass
         finally:
             self._event_log.close()
             self.global_event_sender.close()
@@ -174,47 +237,16 @@ class Master:
                         case TestCommand():
                             pass
                         case TextGeneration():
-                            prefill_only: set[InstanceId] = set()
-                            for link in self.state.instance_links.values():
-                                prefill_only.update(link.prefill_instances)
-                            for link in self.state.instance_links.values():
-                                prefill_only.difference_update(link.decode_instances)
-
-                            for instance in self.state.instances.values():
-                                if (
-                                    instance.shard_assignments.model_id
-                                    == command.task_params.model
-                                    and instance.instance_id not in prefill_only
-                                ):
-                                    in_flight = {TaskStatus.Pending, TaskStatus.Running}
-                                    task_count = sum(
-                                        1
-                                        for task in self.state.tasks.values()
-                                        if task.instance_id == instance.instance_id
-                                        and task.task_status in in_flight
-                                    )
-                                    instance_task_counts[instance.instance_id] = (
-                                        task_count
-                                    )
-
-                            if not instance_task_counts:
-                                raise ValueError(
-                                    f"No instance found for model {command.task_params.model}"
-                                )
-
-                            available_instance_ids = sorted(
-                                instance_task_counts.keys(),
-                                key=lambda instance_id: instance_task_counts[
-                                    instance_id
-                                ],
+                            decode_instance_id = _select_text_generation_instance_id(
+                                self.state, command
                             )
-
-                            decode_instance_id = available_instance_ids[0]
                             task_id = TaskId()
                             params = command.task_params.model_copy(
                                 update={
-                                    "prefill_endpoint": _prefill_endpoint_for(
-                                        self.state, decode_instance_id
+                                    "prefill_endpoint": _prefill_endpoint_for_task(
+                                        self.state,
+                                        decode_instance_id,
+                                        command.task_params,
                                     ),
                                 }
                             )
@@ -231,6 +263,17 @@ class Master:
                                 )
                             )
                             self.command_task_mapping[command.command_id] = task_id
+
+                            if EXO_TRACING_ENABLED:
+                                selected_instance = self.state.instances.get(
+                                    decode_instance_id
+                                )
+                                if selected_instance:
+                                    ranks = set(
+                                        shard.device_rank
+                                        for shard in selected_instance.shard_assignments.runner_to_shard.values()
+                                    )
+                                    self._expected_ranks[task_id] = ranks
                         case ImageGeneration():
                             for instance in self.state.instances.values():
                                 if (
@@ -448,10 +491,12 @@ class Master:
                                 self._event_log.read_range(command.since_idx, end),
                                 start=command.since_idx,
                             ):
-                                await self._send_event(IndexedEvent(idx=i, event=event))
+                                await self._send_indexed_event(
+                                    IndexedEvent(idx=i, event=event)
+                                )
                     for event in generated_events:
                         await self.event_sender.send(event)
-                except ValueError as e:
+                except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
@@ -506,10 +551,10 @@ class Master:
                     self.state = apply(self.state, indexed)
 
                     self._event_log.append(event)
-                    await self._send_event(indexed)
+                    await self._send_indexed_event(indexed)
 
     # This function is re-entrant, take care!
-    async def _send_event(self, event: IndexedEvent):
+    async def _send_indexed_event(self, event: IndexedEvent):
         # Convenience method since this line is ugly
         await self.global_event_sender.send(
             GlobalForwarderEvent(

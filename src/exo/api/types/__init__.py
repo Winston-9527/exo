@@ -1,5 +1,18 @@
+from exo.shared.types.verifiable import (
+    VerifiableChatCompletionRequest as VerifiableChatCompletionRequest,
+)
+from exo.shared.types.verifiable import (
+    VerifiableEncryptedInput as VerifiableEncryptedInput,
+)
+from exo.shared.types.verifiable import (
+    VerifiableGenerationParams as VerifiableGenerationParams,
+)
+from exo.shared.types.verifiable import VerifiableRecipient as VerifiableRecipient
+
 from .api import AddCustomModelParams as AddCustomModelParams
 from .api import AdvancedImageParams as AdvancedImageParams
+from .api import AwaitInstanceReadyMessage as AwaitInstanceReadyMessage
+from .api import AwaitInstanceTimeoutMessage as AwaitInstanceTimeoutMessage
 from .api import BenchChatCompletionRequest as BenchChatCompletionRequest
 from .api import BenchChatCompletionResponse as BenchChatCompletionResponse
 from .api import BenchImageGenerationResponse as BenchImageGenerationResponse
