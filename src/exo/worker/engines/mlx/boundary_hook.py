@@ -28,13 +28,16 @@ Activation = NDArray[np.float32]
 class BoundaryHook:
     """Configures capture/injection at one shard boundary.
 
-    ``capture_callback`` is invoked with the honest activation when capture is
-    enabled. ``inject_fn``, when provided, returns the tensor that replaces the
-    received activation (default None = no injection).
+    ``capture_callback`` is invoked with the honest activation before
+    injection (default None = no capture). ``inject_fn``, when provided,
+    returns the tensor that replaces the received activation. ``after_inject
+    _callback``, when provided, is invoked with the injected (tampered) tensor
+    so an experiment can persist both H (honest) and H̃ (challenged).
     """
 
     capture_callback: Callable[[Activation, int], None] | None = None
     inject_fn: Callable[[Activation, int], Activation] | None = None
+    after_inject_callback: Callable[[Activation, int], None] | None = None
 
 
 def maybe_hook_activation(
@@ -55,7 +58,10 @@ def maybe_hook_activation(
         hook.capture_callback(activation, rank)
 
     if hook.inject_fn is not None:
-        return hook.inject_fn(activation, rank)
+        hooked = hook.inject_fn(activation, rank)
+        if hook.after_inject_callback is not None:
+            hook.after_inject_callback(hooked, rank)
+        return hooked
 
     return activation
 

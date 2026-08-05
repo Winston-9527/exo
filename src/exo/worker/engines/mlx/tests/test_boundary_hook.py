@@ -98,3 +98,33 @@ def test_inject_fn_receives_honest_activation() -> None:
     hook = BoundaryHook(inject_fn=inject_fn)
     maybe_hook_activation(x, hook=hook, rank=1)
     assert np.array_equal(received[0], x)
+
+
+def test_after_inject_callback_records_tampered_tensor() -> None:
+    x = _activation()
+    tampered = np.full_like(x, 9.0)
+    after: list[np.ndarray] = []
+    hook = BoundaryHook(
+        inject_fn=lambda a, r: tampered,
+        after_inject_callback=lambda a, r: after.append(a.copy()),
+    )
+    result = maybe_hook_activation(x, hook=hook, rank=1)
+    assert len(after) == 1
+    assert np.array_equal(after[0], tampered)  # recorded H̃
+    assert np.array_equal(result, tampered)
+
+
+def test_capture_and_after_inject_record_both_tensors() -> None:
+    x = _activation()
+    before: list[np.ndarray] = []
+    after: list[np.ndarray] = []
+    tampered = np.full_like(x, 4.0)
+    hook = BoundaryHook(
+        capture_callback=lambda a, r: before.append(a.copy()),
+        inject_fn=lambda a, r: tampered,
+        after_inject_callback=lambda a, r: after.append(a.copy()),
+    )
+    maybe_hook_activation(x, hook=hook, rank=1)
+    assert np.array_equal(before[0], x)  # H
+    assert np.array_equal(after[0], tampered)  # H̃
+    assert not np.array_equal(before[0], after[0])
