@@ -31,12 +31,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_make_persistent_capture_saves_honest_and_injected(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(
-        "exo.worker.engines.mlx.boundary_hook_config.uuid4",
-        lambda: "00000000-0000-4000-8000-000000000000",
-    )
     capture_cb, after_cb = make_persistent_capture(
         rank=1, boundary="B1", out_dir=tmp_path
     )
@@ -45,13 +41,24 @@ def test_make_persistent_capture_saves_honest_and_injected(
 
     capture_cb(h, 1)
     after_cb(h_tilde, 1)
+    # A second pair to confirm monotonic step ids.
+    capture_cb(h * 2, 1)
+    after_cb(h_tilde * 2, 1)
 
-    files = sorted(tmp_path.glob("*.npz"))
-    assert len(files) == 2
-    honest = np.load(files[0])["activation"]
-    injected = np.load(files[1])["activation"]
-    assert np.allclose(honest, h)
-    assert np.allclose(injected, h_tilde)
+    honest_files = sorted(tmp_path.glob("*_honest.npz"))
+    injected_files = sorted(tmp_path.glob("*_injected.npz"))
+    assert len(honest_files) == 2
+    assert len(injected_files) == 2
+
+    # Pair by shared step id.
+    for honest_path, injected_path in zip(honest_files, injected_files, strict=True):
+        assert honest_path.name.removesuffix("_honest.npz") == (
+            injected_path.name.removesuffix("_injected.npz")
+        )
+    assert np.allclose(np.load(honest_files[0])["activation"], h)
+    assert np.allclose(np.load(injected_files[0])["activation"], h_tilde)
+    assert np.allclose(np.load(honest_files[1])["activation"], h * 2)
+    assert np.allclose(np.load(injected_files[1])["activation"], h_tilde * 2)
 
 
 def test_persistent_capture_via_env(

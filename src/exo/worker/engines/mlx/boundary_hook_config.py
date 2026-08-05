@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from pathlib import Path
-from uuid import uuid4
 
 import numpy as np
 from numpy.typing import NDArray
@@ -52,20 +51,25 @@ def make_persistent_capture(
     """Return (capture, after_inject) callbacks that persist H and H̃ as .npz.
 
     The honest activation is saved with a ``honest`` suffix and the injected
-    (tampered) activation with a ``injected`` suffix so an experiment can pair
-    them and feed both to the P0-E2 verifier for first-mismatch localization.
+    (tampered) activation with a ``injected`` suffix, sharing a monotonically
+    increasing step id so an experiment can pair them and feed both to the
+    P0-E2 verifier for first-mismatch localization.
     """
+    step = 0
 
     def _save(activation: Activation, kind: str) -> None:
+        nonlocal step
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"boundary_{boundary}_rank{rank}_{uuid4()}_{kind}.npz"
+        path = out_dir / f"boundary_{boundary}_rank{rank}_step{step:04d}_{kind}.npz"
         np.savez_compressed(path, activation=np.asarray(activation, dtype=np.float32))
 
     def _capture(activation: Activation, callback_rank: int) -> None:
         _save(activation, "honest")
 
     def _after_inject(activation: Activation, callback_rank: int) -> None:
+        nonlocal step
         _save(activation, "injected")
+        step += 1
 
     return _capture, _after_inject
 
